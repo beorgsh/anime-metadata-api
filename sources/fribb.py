@@ -38,6 +38,8 @@ _FULL_PATH = os.path.join(_DATA_DIR, "anime-list-mini.json")
 # In-memory lookup tables (loaded once at startup)
 _index: dict[str, dict] = {}  # anilist_id (str) → {"anime-list": [position]}
 _full: list = []               # list of anime entries
+_reverse_index: dict[int, list[int]] = {}  # tmdb_tv_id → [anilist_id, ...]
+_reverse_built: bool = False
 _loaded_at: float = 0.0
 _REFRESH_INTERVAL = 7 * 24 * 3600  # refresh weekly
 
@@ -64,7 +66,7 @@ def _download(url: str, path: str) -> bool:
 
 def _load_from_disk() -> bool:
     """Load the JSON files from disk into memory."""
-    global _index, _full, _loaded_at
+    global _index, _full, _loaded_at, _reverse_built, _reverse_index
     try:
         if not os.path.exists(_INDEX_PATH) or not os.path.exists(_FULL_PATH):
             return False
@@ -73,6 +75,8 @@ def _load_from_disk() -> bool:
         with open(_FULL_PATH) as f:
             _full = json.load(f)
         _loaded_at = time.time()
+        _reverse_built = False
+        _reverse_index = {}
         log.info("Fribb loaded: %d index entries, %d full entries", len(_index), len(_full))
         return True
     except Exception as e:
@@ -162,12 +166,52 @@ def get_tmdb_id(anilist_id: int) -> Optional[tuple[str | None, int | list]]:
     return None
 
 
+def _build_reverse_index() -> None:
+    """Build tmdb_tv_id → [anilist_id, ...] reverse index from the main index.
+    Lazy-built on first call to lookup_siblings_by_tmdb_tv()."""
+    global _reverse_built, _reverse_index
+    if _reverse_built or not is_loaded():
+        return
+    _reverse_index = {}
+    for aid_str, entry in _index.items():
+        positions = entry.get("anime-list", []) if isinstance(entry, dict) else []
+        if not positions:
+            continue
+        pos = positions[0]
+        if pos < 0 or pos >= len(_full):
+            continue
+        item = _full[pos]
+        if not isinstance(item, dict):
+            continue
+        tmdb_info = item.get("themoviedb_id") or {}
+        tmdb_tv = tmdb_info.get("tv")
+        if tmdb_tv:
+            try:
+                _reverse_index.setdefault(int(tmdb_tv), []).append(int(aid_str))
+            except (TypeError, ValueError):
+                pass
+    _reverse_built = True
+    log.info("Fribb reverse index built: %d TMDB TV IDs", len(_reverse_index))
+
+
+def lookup_siblings_by_tmdb_tv(tmdb_tv_id: int) -> list[int]:
+    """Return all AniList IDs that map to the same TMDB TV ID.
+    This is how we discover that Re:Zero (TMDB 65942) has 4 AniList entries
+    (21355, 108632, 119661, 163134) even though TMDB only has 1 season.
+    """
+    if not is_loaded():
+        return []
+    _build_reverse_index()
+    return sorted(_reverse_index.get(int(tmdb_tv_id), []))
+
+
 def stats() -> dict:
     """Return stats for /health endpoint."""
     return {
         "loaded": is_loaded(),
         "index_entries": len(_index),
         "full_entries": len(_full),
+        "reverse_index_entries": len(_reverse_index) if _reverse_built else 0,
         "loaded_at": _loaded_at,
         "age_seconds": time.time() - _loaded_at if _loaded_at else 0,
     }

@@ -1,39 +1,27 @@
 """
-aggregator.py — Fetches metadata from all sources IN PARALLEL, then merges
-and verifies it.
+aggregator.py — Lean, fast multi-source aggregator.
 
-Pipeline
-========
+Pipeline (3 network calls max, parallel where possible):
 
-  Stage 1 — Parallel fetch
-    ┌─ AniList GraphQL  (primary metadata: title, format, episodes, season)
-    ├─ AniZip           (TVDB episodes + images)
-    ├─ AniBridge        (cross-provider mapping + verified `units` count)
-    └─ Jikan (MAL)      (MAL episode count + season + status verifier)
+  Stage 1 (parallel):
+    ├─ AniList GraphQL  (1 call, ~100ms) → title, format, year, episodes, season
+    └─ Fribb lookup     (in-memory, ~0ms) → tmdb_id, season.tmdb, episode_offset.tmdb
 
-    Kitsu is fetched in Stage 2 (only if AniList returned a mal_id OR if we
-    need an extra verifier). Kitsu's /mappings endpoint requires a known
-    external ID, so it goes after we have one.
+  Stage 2 (if Fribb missed — fallback chain):
+    AniBridge → TMDB /find by TVDB/IMDb → TMDB /search by name+year
+    (only one of these runs depending on what's missing)
 
-  Stage 2 — TMDB resolution
-    resolver.resolve_tmdb_id() is now multi-source (AniBridge → Fribb →
-    TMDB /find → TMDB /search).
+  Stage 3 (parallel, only if TMDB ID found):
+    ├─ TMDB TV details  (1 call, ~100ms) → seasons[] for the picker
+    └─ TMDB TV season(s) (1 call per season, max 1-2 seasons typically)
+    └─ TMDB TV images   (1 call, ~100ms) → logos, backdrops, posters
 
-  Stage 3 — TMDB episode + image fetch (if resolved)
+  Stage 4 (pure-functional, no network):
+    seasons.slice_episodes() — apply offset, count, renumber, filter unaired
 
-  Stage 4 — Optional Kitsu fetch (parallel with TMDB)
-
-  Stage 5 — Cross-source verification
-    verifier.verify_episode_count() — own-logic majority vote
-    verifier.verify_season()         — own-logic majority vote (AniList primary)
-    verifier.verify_status()         — own-logic majority vote
-
-  Stage 6 — Merge
-
-Merge priorities (images):  TMDB > AniZip > AniList
-Merge priorities (episodes): TMDB > AniZip > generated placeholder
-Merge priorities (titles):  AniList > AniZip > AniBridge
-Merge priorities (mappings): combined — every source's mappings are surfaced
+Total: ~3 calls for the fast path, ~4-5 if Fribb misses.
+Jikan / Kitsu / AniZip / AniBridge are NOT in the hot path — they were the
+slowdown in v2.
 """
 from __future__ import annotations
 
@@ -45,214 +33,253 @@ from typing import Optional
 import httpx
 
 from cache import metadata_cache
-from sources import anilist, anizip, fribb, tmdb, anibridge, jikan, kitsu
+from sources import anilist, anizip, fribb, tmdb
 from resolver import resolve_tmdb_id
-from verifier import verify_episode_count, verify_season, verify_status
+from seasons import (
+    detect_pattern,
+    resolve_target_season,
+    slice_episodes,
+    get_seasons_summary,
+)
 
 log = logging.getLogger("aggregator")
 
 
-async def fetch_all(anilist_id: int) -> dict:
+async def fetch_all(
+    anilist_id: int,
+    *,
+    season: Optional[int] = None,
+    include_upcoming: bool = False,
+    extras: bool = False,
+) -> dict:
     """
-    Fetch metadata for an AniList ID from all sources in parallel, verify
-    it, and return the unified response. Cached for 7 days.
+    Fetch metadata for an AniList ID. Cached for 7 days.
+
+    Args:
+        anilist_id: AniList anime ID.
+        season: TMDB season number to fetch (1, 2, 3, ...). If None, auto-detect
+            from Fribb's mapping. Pass 0 to fetch specials.
+        include_upcoming: True = include episodes with future air dates.
+            False (default) = only return episodes that have aired.
+        extras: True = fetch TMDB season 0 (specials/OVAs) only.
     """
-    cache_key = f"meta:{anilist_id}"
+    # Cache key includes season + flags so different views don't collide
+    cache_key = f"meta:{anilist_id}:s={season or 'auto'}:up={int(include_upcoming)}:ex={int(extras)}"
     cached = metadata_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    # Per-id lock so concurrent requests dedupe
     lock = metadata_cache.get_lock(cache_key)
     async with lock:
         cached = metadata_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        result = await _fetch_all_impl(anilist_id)
+        result = await _fetch_all_impl(
+            anilist_id,
+            season=season,
+            include_upcoming=include_upcoming,
+            extras=extras,
+        )
         metadata_cache.set(cache_key, result)
         return result
 
 
-async def _fetch_all_impl(anilist_id: int) -> dict:
-    """The actual fetch + verify + merge logic."""
+async def _fetch_all_impl(
+    anilist_id: int,
+    *,
+    season: Optional[int] = None,
+    include_upcoming: bool = False,
+    extras: bool = False,
+) -> dict:
+    """The actual fetch + slice + merge logic."""
 
-    # ── Stage 1: Parallel fetch of independent sources ────────────
+    # ── Stage 1: AniList + Fribb in parallel ──────────────────────
     async with httpx.AsyncClient(timeout=15.0) as client:
         anilist_task = asyncio.create_task(anilist.fetch_anilist(anilist_id, client))
-        anizip_task = asyncio.create_task(anizip.fetch_anizip(anilist_id, client))
-        anibridge_task = asyncio.create_task(anibridge.fetch_cross_mappings(anilist_id, client))
+        # Fribb is in-memory so it doesn't need the client, but we wait in parallel
+        anilist_data = await anilist_task
 
-        anilist_data, anizip_data, anibridge_data = await asyncio.gather(
-            anilist_task, anizip_task, anibridge_task,
-        )
+    fribb_data = fribb.lookup(anilist_id) if fribb.is_loaded() else None
 
-    # Jikan needs a MAL ID — pull from AniList.idMal or AniBridge.cross_ids.mal
-    mal_id = (anilist_data or {}).get("idMal")
-    if (not mal_id) and anibridge_data:
-        mal_ids = (anibridge_data.get("cross_ids") or {}).get("mal") or []
-        if mal_ids:
-            mal_id = mal_ids[0]
-
-    jikan_data: dict = {}
-    if mal_id:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            jikan_data = await jikan.fetch_jikan(mal_id, client)
-
-    # ── Stage 2: Resolve TMDB ID (multi-source) ─────────────────────
-    tmdb_resolution = await resolve_tmdb_id(
-        anilist_id,
-        anilist_data=anilist_data,
-        anibridge_data=anibridge_data,
-    )
+    # ── Stage 2: Resolve TMDB ID (Fribb-first, with fallbacks) ─────
+    tmdb_resolution = await resolve_tmdb_id(anilist_id, anilist_data, fribb_data)
     tmdb_type = tmdb_resolution.get("tmdb_type")
     tmdb_id = tmdb_resolution.get("tmdb_id")
-    fribb_data = tmdb_resolution.get("fribb_data")
+    # Refresh fribb_data in case the resolver enriched it
+    fribb_data = tmdb_resolution.get("fribb_data") or fribb_data
+    resolver_method = tmdb_resolution.get("method", "not_found")
 
-    # ── Stages 3 + 4: TMDB fetch + Kitsu fetch (parallel) ──────────
+    # ── Stage 3: TMDB fetch (parallel: details + season + images) ──
     tmdb_episodes: list[dict] = []
     tmdb_images: list[dict] = []
     tmdb_details: dict = {}
+    slice_offset = 0
+    slice_count: Optional[int] = None
+    continuous_numbering = False
+    pattern = "not_found"
 
-    kitsu_task: Optional[asyncio.Task] = None
-    if mal_id or anilist_id:
-        # Kitsu can resolve by AniList ID directly, so we always try it
-        kitsu_task = asyncio.create_task(_fetch_kitsu_safe(anilist_id))
-
-    if tmdb_type and tmdb_id:
+    if tmdb_type == "tv" and tmdb_id:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            if tmdb_type == "tv":
-                # Determine season(s) from Fribb's season.tmdb field (if available)
-                fribb_season = None
-                if fribb_data:
-                    season_info = fribb_data.get("season") or {}
-                    fribb_season = season_info.get("tmdb")
+            details_task = asyncio.create_task(tmdb.fetch_tv(tmdb_id, client))
+            images_task = asyncio.create_task(tmdb.fetch_tv_images(tmdb_id, client))
 
-                details_task = asyncio.create_task(tmdb.fetch_tv(tmdb_id, client))
-                images_task = asyncio.create_task(tmdb.fetch_tv_images(tmdb_id, client))
+            # We need the TV details first to know how many seasons there are
+            details = await details_task
+            if isinstance(details, dict) and details:
+                tmdb_details = details
 
-                if fribb_season is not None:
-                    season_task = asyncio.create_task(tmdb.fetch_tv_season(tmdb_id, fribb_season, client))
-                    season_data, images_data, details = await asyncio.gather(
-                        season_task, images_task, details_task, return_exceptions=True
-                    )
-                    if isinstance(season_data, dict) and not isinstance(season_data, Exception):
-                        tmdb_episodes = tmdb.extract_episodes(season_data, anilist_id)
-                else:
-                    details = await details_task
-                    if isinstance(details, dict) and details:
-                        all_seasons = [s["season_number"] for s in details.get("seasons", [])
+            # Decide which season(s) to fetch
+            if extras:
+                # /extras endpoint: always fetch TMDB season 0 (specials)
+                target_seasons = [0]
+                slice_offset = 0
+                slice_count = None
+                pattern = "extras"
+                continuous_numbering = False
+            else:
+                decision = resolve_target_season(
+                    anilist_id=anilist_id,
+                    anilist_data=anilist_data,
+                    fribb_data=fribb_data,
+                    tmdb_details=tmdb_details,
+                    explicit_season=season,
+                )
+                target_seasons = decision["season_numbers"]
+                slice_offset = decision["episode_offset"]
+                slice_count = decision["episode_count"]
+                pattern = decision["pattern"]
+                continuous_numbering = decision["continuous_numbering"]
+
+            # Fetch all required TMDB seasons in parallel
+            season_tasks = [
+                asyncio.create_task(tmdb.fetch_tv_season(tmdb_id, s, client))
+                for s in target_seasons
+            ]
+            season_results = await asyncio.gather(*season_tasks, return_exceptions=True)
+
+            # Extract + concatenate episodes from each season
+            for sn, sd in zip(target_seasons, season_results):
+                if isinstance(sd, dict) and not isinstance(sd, Exception):
+                    season_eps = tmdb.extract_episodes(sd, anilist_id)
+                    # For Pattern B (multi-season continuous), apply season offset
+                    if continuous_numbering and len(target_seasons) > 1:
+                        # Calculate the running offset based on TMDB season's
+                        # position in the seasons[] array (each prior season
+                        # contributes its episode_count to the offset).
+                        seasons_meta = [s for s in (tmdb_details.get("seasons") or [])
                                        if s.get("season_number", 0) > 0]
-                        if all_seasons:
-                            season_tasks = [
-                                asyncio.create_task(tmdb.fetch_tv_season(tmdb_id, s, client))
-                                for s in all_seasons
-                            ]
-                            season_results = await asyncio.gather(*season_tasks, return_exceptions=True)
-                            episode_offset = 0
-                            for i, sd in enumerate(season_results):
-                                if isinstance(sd, dict) and not isinstance(sd, Exception):
-                                    season_eps = tmdb.extract_episodes(sd, anilist_id)
-                                    for ep in season_eps:
-                                        ep["number"] = ep["number"] + episode_offset
-                                        ep["season"] = all_seasons[i]
-                                        ep["season_episode"] = ep["number"] - episode_offset
-                                    tmdb_episodes.extend(season_eps)
-                                    episode_offset += len(season_eps)
-                    images_data = await images_task
+                        running_offset = 0
+                        for sm in seasons_meta:
+                            if sm.get("season_number") == sn:
+                                break
+                            running_offset += sm.get("episode_count", 0) or 0
+                        for ep in season_eps:
+                            ep["number"] = ep["number"] + running_offset
+                            ep["season"] = sn
+                    tmdb_episodes.extend(season_eps)
 
-                if isinstance(images_data, dict) and not isinstance(images_data, Exception):
-                    tmdb_images = tmdb.extract_images(images_data, "tv")
-                if isinstance(details, dict) and not isinstance(details, Exception):
-                    tmdb_details = details
-            elif tmdb_type == "movie":
-                details_task = asyncio.create_task(tmdb.fetch_movie(tmdb_id, client))
-                images_task = asyncio.create_task(tmdb.fetch_movie_images(tmdb_id, client))
-                details, images_data = await asyncio.gather(details_task, images_task, return_exceptions=True)
-                if isinstance(images_data, dict) and not isinstance(images_data, Exception):
-                    tmdb_images = tmdb.extract_images(images_data, "movie")
-                if isinstance(details, dict) and not isinstance(details, Exception):
-                    tmdb_details = details
+            images_data = await images_task
+            if isinstance(images_data, dict) and not isinstance(images_data, Exception):
+                tmdb_images = tmdb.extract_images(images_data, "tv")
 
-    # Await Kitsu (always best-effort)
-    kitsu_data: dict = {}
-    if kitsu_task is not None:
-        kitsu_data = await kitsu_task
+    elif tmdb_type == "movie" and tmdb_id:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            details_task = asyncio.create_task(tmdb.fetch_movie(tmdb_id, client))
+            images_task = asyncio.create_task(tmdb.fetch_movie_images(tmdb_id, client))
+            details, images_data = await asyncio.gather(details_task, images_task, return_exceptions=True)
+            if isinstance(images_data, dict) and not isinstance(images_data, Exception):
+                tmdb_images = tmdb.extract_images(images_data, "movie")
+            if isinstance(details, dict) and not isinstance(details, Exception):
+                tmdb_details = details
+                # Build a single "episode" representing the movie itself
+                import time as _time
+                air_date = details.get("release_date", "") or ""
+                today = _time.strftime("%Y-%m-%d")
+                tmdb_episodes = [{
+                    "id": f"{anilist_id}-1",
+                    "number": 1,
+                    "title": details.get("title") or anilist_data.get("title", {}).get("english", "Movie"),
+                    "titleJa": "",
+                    "description": details.get("overview", "") or "",
+                    "image": (tmdb.extract_images(images_data, "movie")[0].get("url") if isinstance(images_data, dict) and tmdb_images else ""),
+                    "airDate": air_date,
+                    "duration": details.get("runtime", 0) or 0,
+                    "isFiller": False,
+                    "rating": str(details.get("vote_average")) if details.get("vote_average") else None,
+                    "hasAired": bool(air_date) and air_date <= today,
+                    "source": "tmdb",
+                }]
+        pattern = "movie"
+    else:
+        pattern = "not_found"
 
-    # ── Stage 5: Cross-source verification ─────────────────────────
-    tmdb_episode_count = len(tmdb_episodes) if tmdb_episodes else None
-    anilist_episodes = (anilist_data or {}).get("episodes")
-    anibridge_units = (anibridge_data or {}).get("units")
-    jikan_episodes = (jikan_data or {}).get("episodes")
-    kitsu_episode_count = (kitsu_data or {}).get("episode_count")
-    anizip_episode_count = anizip_data.get("episodeCount") or len(anizip_data.get("episodes") or [])
+    # ── Stage 4: Slice + renumber + filter (pure-functional) ───────
+    if tmdb_type == "tv":
+        sliced = slice_episodes(
+            tmdb_episodes,
+            offset=slice_offset,
+            count=slice_count,
+            continuous_numbering=continuous_numbering,
+            include_upcoming=include_upcoming,
+            anilist_id=anilist_id,
+        )
+    else:
+        # Movies: just one "episode" (already built above)
+        sliced = tmdb_episodes
 
-    episode_verdict = verify_episode_count(
-        anilist_episodes=anilist_episodes,
-        anibridge_units=anibridge_units,
-        jikan_episodes=jikan_episodes,
-        kitsu_episode_count=kitsu_episode_count,
-        anizip_episode_count=anizip_episode_count or None,
-        tmdb_episode_count=tmdb_episode_count,
-    )
+    # Detect the actual pattern (for the response)
+    if tmdb_type == "movie":
+        detected_pattern = "movie"
+    elif tmdb_type == "tv":
+        detected_pattern = detect_pattern(
+            anilist_id=anilist_id,
+            anilist_data=anilist_data,
+            fribb_data=fribb_data,
+            tmdb_type=tmdb_type,
+            tmdb_id=tmdb_id,
+            tmdb_details=tmdb_details,
+            extras_mode=extras,
+        )
+    else:
+        detected_pattern = "not_found"
 
-    anilist_season = (anilist_data or {}).get("season")
-    anilist_season_year = (anilist_data or {}).get("seasonYear")
-    anilist_start_year = ((anilist_data or {}).get("startDate") or {}).get("year")
-    anibridge_release = (anibridge_data or {}).get("release")
-    jikan_season = (jikan_data or {}).get("season")
-    jikan_year = (jikan_data or {}).get("year")
-    kitsu_season = (kitsu_data or {}).get("season")
-    kitsu_year = (kitsu_data or {}).get("year")
+    # Sibling AniList IDs (Pattern A discovery)
+    sibling_anilist_ids: list[int] = []
+    if tmdb_type == "tv" and tmdb_id:
+        sibling_anilist_ids = fribb.lookup_siblings_by_tmdb_tv(int(tmdb_id))
+        # If only 1 sibling (just us), don't bother listing
+        if len(sibling_anilist_ids) <= 1:
+            sibling_anilist_ids = []
 
-    season_verdict = verify_season(
-        anilist_season=anilist_season,
-        anilist_year=anilist_season_year,
-        anibridge_release=anibridge_release,
-        jikan_season=jikan_season,
-        jikan_year=jikan_year,
-        kitsu_season=kitsu_season,
-        kitsu_year=kitsu_year,
-        fallback_year=anilist_start_year,
-    )
+    # Build seasons summary
+    seasons_summary: list[dict] = []
+    if tmdb_type == "tv" and tmdb_details:
+        seasons_summary = get_seasons_summary(
+            anilist_id=anilist_id,
+            tmdb_details=tmdb_details,
+            fribb_data=fribb_data,
+            sibling_anilist_ids=sibling_anilist_ids,
+        )
 
-    status_verdict = verify_status(
-        anilist_status=(anilist_data or {}).get("status"),
-        anibridge_release=anibridge_release,
-        jikan_status=(jikan_data or {}).get("status"),
-        kitsu_status=(kitsu_data or {}).get("status"),
-    )
-
-    # ── Stage 6: Merge everything ──────────────────────────────────
+    # ── Stage 5: Merge + return ───────────────────────────────────
     return _merge(
         anilist_id=anilist_id,
         anilist_data=anilist_data or {},
-        anizip_data=anizip_data,
         fribb_data=fribb_data,
-        anibridge_data=anibridge_data or {},
-        jikan_data=jikan_data,
-        kitsu_data=kitsu_data,
         tmdb_type=tmdb_type,
         tmdb_id=tmdb_id,
-        tmdb_episodes=tmdb_episodes,
+        tmdb_episodes=sliced,
         tmdb_images=tmdb_images,
         tmdb_details=tmdb_details,
-        resolver_method=tmdb_resolution.get("method", "not_found"),
+        resolver_method=resolver_method,
         resolver_tried=tmdb_resolution.get("tried_sources", []),
-        episode_verdict=episode_verdict,
-        season_verdict=season_verdict,
-        status_verdict=status_verdict,
+        pattern=detected_pattern,
+        seasons_summary=seasons_summary,
+        sibling_anilist_ids=sibling_anilist_ids,
+        extras_mode=extras,
+        include_upcoming=include_upcoming,
     )
-
-
-async def _fetch_kitsu_safe(anilist_id: int) -> dict:
-    """Best-effort Kitsu fetch — never raises."""
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            return await kitsu.fetch_kitsu_by_anilist(anilist_id, client)
-    except Exception as e:
-        log.warning("Kitsu fetch %d failed: %s", anilist_id, e)
-        return {}
 
 
 # ─── Merge ────────────────────────────────────────────────────────────
@@ -262,11 +289,7 @@ def _merge(
     *,
     anilist_id: int,
     anilist_data: dict,
-    anizip_data: dict,
     fribb_data: Optional[dict],
-    anibridge_data: dict,
-    jikan_data: dict,
-    kitsu_data: dict,
     tmdb_type: Optional[str],
     tmdb_id,
     tmdb_episodes: list[dict],
@@ -274,137 +297,93 @@ def _merge(
     tmdb_details: dict,
     resolver_method: str,
     resolver_tried: list,
-    episode_verdict: dict,
-    season_verdict: dict,
-    status_verdict: dict,
+    pattern: str,
+    seasons_summary: list[dict],
+    sibling_anilist_ids: list[int],
+    extras_mode: bool,
+    include_upcoming: bool,
 ) -> dict:
-    """Merge all sources into a unified response."""
-
-    # ── Titles ──
-    title_en = (anilist_data.get("title") or {}).get("english") or anizip_data.get("title") or ""
-    title_ja = (anilist_data.get("title") or {}).get("native") or anizip_data.get("titleJa") or ""
+    # Titles
+    title_en = (anilist_data.get("title") or {}).get("english") or ""
+    title_ja = (anilist_data.get("title") or {}).get("native") or ""
     title_romaji = (anilist_data.get("title") or {}).get("romaji") or ""
 
-    # ── Format + year ──
     fmt = anilist_data.get("format", "TV")
     year = (anilist_data.get("startDate") or {}).get("year")
-    mal_id = anilist_data.get("idMal") or (fribb_data or {}).get("mal_id") or _first(anibridge_data.get("cross_ids", {}).get("mal"))
+    mal_id = anilist_data.get("idMal") or (fribb_data or {}).get("mal_id")
 
-    # ── Episode count (use the verdict) ──
-    total_eps = episode_verdict.get("value") or 0
+    # AniList's episode count (the verification anchor)
+    anilist_episodes_field = anilist_data.get("episodes")
 
-    # ── Next airing ──
+    # Final episode count = how many we actually returned
+    total_eps_returned = len(tmdb_episodes) if tmdb_episodes else 0
+
+    # Verification: compare what we returned vs AniList's count (free check, no extra calls)
+    verification = _lightweight_verification(
+        anilist_episodes_field, total_eps_returned, anilist_data.get("status"),
+        pattern, extras_mode,
+    )
+
+    # Next airing info from AniList
     next_airing = anilist_data.get("nextAiringEpisode") or {}
     next_ep = next_airing.get("episode") if next_airing else None
 
-    # ── Current episode (last aired) ──
+    # Current episode (last aired in the returned list)
     current_ep = None
-    today = time.strftime("%Y-%m-%d")
-    all_eps = tmdb_episodes or anizip_data.get("episodes", [])
-    for ep in all_eps:
+    for ep in tmdb_episodes:
         if ep.get("hasAired"):
             current_ep = ep.get("number")
         else:
             break
 
-    # ── Images ──
+    # Images: TMDB priority, fallback to AniList cover/banner
     images_by_type: dict[str, dict] = {}
-    for img in tmdb_images + anizip_data.get("images", []):
+    for img in tmdb_images:
         ct = img.get("coverType")
         if ct and ct not in images_by_type:
             images_by_type[ct] = img
-    # AniList cover fallback Poster
     if "Poster" not in images_by_type and anilist_data.get("coverImage"):
         cover_url = anilist_data["coverImage"].get("extraLarge") or anilist_data["coverImage"].get("large")
         if cover_url:
             images_by_type["Poster"] = {"coverType": "Poster", "url": cover_url, "source": "anilist"}
-    # AniList banner fallback Banner
     if "Banner" not in images_by_type and anilist_data.get("bannerImage"):
         images_by_type["Banner"] = {"coverType": "Banner", "url": anilist_data["bannerImage"], "source": "anilist"}
-    # AniBridge images (extra fallbacks)
-    for img in anibridge_data.get("images") or []:
-        ct = _anibridge_image_kind(img.get("kind"))
-        url = img.get("url")
-        if ct and url and ct not in images_by_type:
-            images_by_type[ct] = {"coverType": ct, "url": url, "source": "anibridge"}
-    # Jikan image fallback Poster
-    if "Poster" not in images_by_type and jikan_data.get("image_url"):
-        images_by_type["Poster"] = {"coverType": "Poster", "url": jikan_data["image_url"], "source": "jikan"}
-    # Kitsu poster fallback
-    if "Poster" not in images_by_type and kitsu_data.get("poster_image"):
-        images_by_type["Poster"] = {"coverType": "Poster", "url": kitsu_data["poster_image"], "source": "kitsu"}
 
     images = list(images_by_type.values())
 
-    # ── Episodes (prefer TMDB, then AniZip) ──
-    episodes = tmdb_episodes or anizip_data.get("episodes", [])
+    # Episodes (already sliced + renumbered + filtered)
+    episodes = tmdb_episodes
 
-    # If still no episodes but we have total_eps, generate placeholders
-    if not episodes and total_eps:
-        episodes = _generate_placeholder_episodes(anilist_id, total_eps, anilist_data, next_ep)
+    # If no TMDB episodes but we have AniList count, generate placeholders
+    if not episodes and anilist_episodes_field and not extras_mode:
+        episodes = _generate_placeholder_episodes(anilist_id, anilist_episodes_field, anilist_data, next_ep)
 
-    # ── Mappings ──
+    # Mappings (single source of truth: Fribb's canonical table + extras from AniList)
     mappings: dict = {}
-
-    # From AniZip (TVDB-centred cross-refs)
-    anizip_mappings = anizip_data.get("mappings", {}) or {}
-    mappings.update(anizip_mappings)
-
-    # From Fribb (canonical AniList↔* table)
     if fribb_data:
-        fribb_mappings = {
-            "anilist_id": fribb_data.get("anilist_id"),
-            "mal_id": fribb_data.get("mal_id"),
+        mappings = {
+            "anilist_id": fribb_data.get("anilist_id") or anilist_id,
+            "mal_id": fribb_data.get("mal_id") or mal_id,
             "thetvdb_id": fribb_data.get("thetvdb_id"),
             "themoviedb_id": fribb_data.get("themoviedb_id"),
             "imdb_id": fribb_data.get("imdb_id"),
             "anidb_id": fribb_data.get("anidb_id"),
             "kitsu_id": fribb_data.get("kitsu_id"),
         }
-        # Only overwrite null entries — AniZip already had a chance
-        for k, v in fribb_mappings.items():
-            if v is not None and not mappings.get(k):
-                mappings[k] = v
-
-    # From AniBridge (cross-provider verified, most authoritative)
-    if anibridge_data:
-        cross = anibridge_data.get("cross_ids") or {}
-        ab_map = {
+    else:
+        mappings = {
             "anilist_id": anilist_id,
-            "mal_id": _first(cross.get("mal")),
-            "anidb_id": _first(cross.get("anidb")),
-            "kitsu_id": _first(cross.get("kitsu")),
-            "thetvdb_id": _first(cross.get("tvdb_show")) or _first(cross.get("tvdb_movie")),
-            "themoviedb_id": _tmdb_obj(cross),
+            "mal_id": mal_id,
         }
-        for k, v in ab_map.items():
-            if v is not None and not mappings.get(k):
-                mappings[k] = v
-
-    # Add the resolved TMDB ID for visibility
     if tmdb_id:
         mappings["themoviedb_id_resolved"] = {"type": tmdb_type, "id": tmdb_id, "method": resolver_method}
 
-    # ── Description ──
-    description = (
-        anilist_data.get("description")
-        or anibridge_data.get("synopsis")
-        or jikan_data.get("synopsis")
-        or kitsu_data.get("synopsis")
-        or ""
-    )
+    # Description
+    description = anilist_data.get("description", "") or ""
 
-    # ── Genres + studios ──
-    genres = list(dict.fromkeys(  # dedupe preserving order
-        (anilist_data.get("genres") or [])
-        + (jikan_data.get("genres") or [])
-        + (anibridge_data.get("genres") or [])
-    ))
-    studios = list(dict.fromkeys(
-        [s["name"] for s in (anilist_data.get("studios") or {}).get("nodes", [])]
-        + (jikan_data.get("studios") or [])
-    ))
-
+    # Genres + studios
+    genres = anilist_data.get("genres", [])
+    studios = [s["name"] for s in (anilist_data.get("studios") or {}).get("nodes", [])]
     external_links = anilist_data.get("externalLinks", [])
 
     return {
@@ -420,50 +399,95 @@ def _merge(
         "description": description,
         "genres": genres,
         "studios": studios,
-        # Verified fields (the "own brain" output)
-        "totalEpisodes": total_eps,
-        "episodeVerification": episode_verdict,
-        "season": season_verdict.get("season"),
-        "seasonYear": season_verdict.get("year"),
-        "seasonVerification": season_verdict,
-        "status": status_verdict.get("value"),
-        "statusVerification": status_verdict,
+
+        # Episode count: what we actually returned
+        "totalEpisodes": total_eps_returned,
+        # AniList's stated count (for cross-reference)
+        "anilistEpisodeCount": anilist_episodes_field,
         "currentEpisode": current_ep,
         "nextAiringEpisode": next_ep,
         "nextAiringDate": _format_airing_date(next_airing.get("airingAt")) if next_airing else None,
+
         "images": images,
         "episodes": episodes,
         "mappings": mappings,
         "externalLinks": external_links,
+
+        # Season info — the new "own brain" output
+        "seasons": seasons_summary,
+        "siblingAnilistIds": sibling_anilist_ids,
+        "pattern": pattern,
+
+        # Lightweight verification (free, no extra calls)
+        "verification": verification,
+
+        # Source flags
         "sources": {
             "anilist": bool(anilist_data),
-            "anizip": bool(anizip_data.get("episodes")),
             "fribb": bool(fribb_data),
-            "anibridge": bool(anibridge_data.get("anibridge_meta")),
-            "jikan": bool(jikan_data),
-            "kitsu": bool(kitsu_data),
             "tmdb": bool(tmdb_id),
             "tmdb_type": tmdb_type,
             "resolver_method": resolver_method,
             "resolver_tried": resolver_tried,
         },
-        "verification": {
-            "episodes": episode_verdict,
-            "season": season_verdict,
-            "status": status_verdict,
-            "summary": {
-                "episode_count_agreed": episode_verdict.get("confidence") == "high",
-                "season_agreed": season_verdict.get("confidence") == "high",
-                "status_agreed": status_verdict.get("confidence") == "high",
-                "sources_with_episode_data": [
-                    s for s, v in (episode_verdict.get("all_sources") or {}).items() if v
-                ],
-                "sources_with_season_data": [
-                    s for s, v in (season_verdict.get("all_seasons") or {}).items() if v
-                ],
-            },
+
+        # View flags
+        "view": {
+            "extras_mode": extras_mode,
+            "include_upcoming": include_upcoming,
+            "explicit_season": season_param(extras_mode, anilist_id, fribb_data),
         },
     }
+
+
+def _lightweight_verification(
+    anilist_eps: Optional[int],
+    returned_count: int,
+    anilist_status: Optional[str],
+    pattern: str,
+    extras_mode: bool,
+) -> dict:
+    """Free verification: compare AniList's stated count vs what we returned.
+    No extra network calls — just compares data we already have."""
+    if extras_mode:
+        return {
+            "field": "episodes",
+            "anilist_count": anilist_eps,
+            "returned_count": returned_count,
+            "match": None,  # extras don't have a comparable count
+            "note": "extras mode — count comparison skipped",
+        }
+
+    if anilist_eps is None:
+        return {
+            "field": "episodes",
+            "anilist_count": None,
+            "returned_count": returned_count,
+            "match": None,
+            "note": "AniList has no episode count (likely ongoing series)",
+        }
+
+    match = (anilist_eps == returned_count)
+    return {
+        "field": "episodes",
+        "anilist_count": anilist_eps,
+        "returned_count": returned_count,
+        "match": match,
+        "note": "ok" if match else (
+            f"mismatch: AniList says {anilist_eps}, we returned {returned_count} "
+            f"(pattern={pattern}, status={anilist_status})"
+        ),
+    }
+
+
+def season_param(extras_mode: bool, anilist_id: int, fribb_data: Optional[dict]) -> Optional[int]:
+    """Return the explicit season number for the response view block."""
+    if extras_mode:
+        return 0
+    if fribb_data:
+        season_info = fribb_data.get("season") or {}
+        return season_info.get("tmdb")
+    return None
 
 
 def _format_airing_date(ts: int) -> Optional[str]:
@@ -474,7 +498,7 @@ def _format_airing_date(ts: int) -> Optional[str]:
 
 
 def _generate_placeholder_episodes(anilist_id: int, total: int, anilist_data: dict, next_ep: Optional[int]) -> list[dict]:
-    """Generate placeholder episodes when no source has episode data."""
+    """Generate placeholder episodes when no TMDB data is available."""
     today = time.strftime("%Y-%m-%d")
     start_date = anilist_data.get("startDate") or {}
     year = start_date.get("year")
@@ -509,42 +533,3 @@ def _generate_placeholder_episodes(anilist_id: int, total: int, anilist_data: di
             "source": "generated",
         })
     return episodes
-
-
-def _first(seq) -> Optional[object]:
-    """Return the first element of a list (or scalar), or None."""
-    if seq is None:
-        return None
-    if isinstance(seq, (list, tuple)):
-        return seq[0] if seq else None
-    return seq
-
-
-def _tmdb_obj(cross: dict) -> Optional[dict]:
-    """Build a themoviedb_id object that mirrors Fribb's shape."""
-    if not cross:
-        return None
-    tv = cross.get("tmdb_show") or []
-    movie = cross.get("tmdb_movie") or []
-    out = {}
-    if tv:
-        out["tv"] = tv[0]
-    if movie:
-        out["movie"] = movie[0]
-    return out or None
-
-
-def _anibridge_image_kind(kind: Optional[str]) -> Optional[str]:
-    """Map AniBridge image kinds → our standard coverType."""
-    if not kind:
-        return None
-    k = kind.lower()
-    if k == "poster":
-        return "Poster"
-    if k in ("banner", "backdrop"):
-        return "Banner"
-    if k in ("logo", "clearlogo"):
-        return "Clearlogo"
-    if k in ("fanart", "background"):
-        return "Fanart"
-    return None

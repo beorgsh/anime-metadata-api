@@ -1,30 +1,192 @@
 # Anime Metadata API
 
-Multi-source anime metadata API. Input an **AniList ID** → get back verified episode titles, thumbnails, banners, clearlogos, posters, and cross-database mappings.
+Multi-source anime metadata API. Input an **AniList ID** → get back sliced + renumbered episode titles, thumbnails, banners, clearlogos, posters, and cross-database mappings.
 
-**What changed in v2.0.0**: We no longer depend solely on Fribb for AniList↔TMDB resolution. The API now fans out to **7 sources in parallel**, then runs its **own verification logic** (`verifier.py`) to cross-check episode count, season, and airing status, and surfaces a confidence verdict + a list of discrepancies in every response.
+**v3.0.0 — lean + fast + multi-season aware.** The pipeline now does just 3 network calls (AniList + Fribb + TMDB) instead of v2's 7-source fan-out, and the API's "own brain" (`seasons.py`) handles all 3 multi-season patterns correctly.
 
-## Sources (v2)
+## The 3 multi-season patterns
 
-| # | Source | Role | Key | Notes |
-|---|--------|------|-----|-------|
-| 1 | **AniList GraphQL** | Primary metadata (title, format, year, episode count, season, status) | none | The "graph URL" used as the verification anchor |
-| 2 | **AniBridge** | Live cross-provider mapping API (AniList ↔ AniDB ↔ MAL ↔ Kitsu ↔ TMDB ↔ TVDB ↔ IMDB) + cross-verified `units` count | none | New in v2. Replaces Fribb as the primary mapping source |
-| 3 | **Jikan / MyAnimeList** | Episode count + season + status verifier | none | Rate-limited (3 req/sec) |
-| 4 | **Kitsu** | Episode count + season + status verifier | none | Resolves AniList → Kitsu via the `/mappings` endpoint |
-| 5 | **AniZip** | TVDB images (banner, poster, fanart, clearlogo) + TVDB episodes | none | |
-| 6 | **TMDB** | Episode stills + logos + backdrops + posters | bundled demo key (override via `TMDB_API_KEY`) | Used for both TV and Movie entries |
-| 7 | **Fribb / anime-lists** | Secondary AniList↔TMDB static mapping fallback | none | Loaded into memory at startup (~weekly refresh) |
+| Pattern | Example | What it means |
+|---------|---------|----------------|
+| **A** | Re:Zero (AniList 21355, 108632, 119661, 163134) | AniList splits a show into multiple entries. TMDB merges them into one 85-episode S1. Fribb's `episode_offset.tmdb` tells us where each AniList entry starts (S1=0, S2P1=26, S2P2=38, S3=50). We slice + renumber 1..N per AniList entry. |
+| **B** | One Piece (AniList 21) | One AniList entry, many TMDB seasons (23). We fetch all seasons in parallel, concatenate, continuous numbering, filter out unaired episodes. AniList says next is 1174 → we return 1173 aired. |
+| **C** | Cowboy Bebop, FMA: Brotherhood | One AniList entry, one TMDB season — the simple case. |
+
+The response includes a `pattern` field so the frontend knows what's going on.
+
+## Sources (lean v3 pipeline)
+
+| # | Source | Role | Latency |
+|---|--------|------|---------|
+| 1 | **AniList GraphQL** | Primary metadata: title, format, year, episode count, season, status | ~100ms |
+| 2 | **Fribb** (in-memory) | AniList↔TMDB mapping + `season.tmdb` + `episode_offset.tmdb` + reverse index (TMDB→siblings) | ~0ms |
+| 3 | **TMDB** | Episodes with stills + images (only the right season, sliced) | ~100ms |
+
+**Fallback chain** (only runs if Fribb misses):
+- AniBridge (1 call, ~150ms)
+- TMDB `/find` by TVDB/IMDb ID (1 call)
+- TMDB `/search` by name + year (1 call)
+
+**Dropped from hot path** (they were v2's slowdown):
+- Jikan/MAL (often 504s)
+- Kitsu (extra round-trip)
+- AniZip (TMDB images are usually faster)
+- AniBridge cross-mapping chase (only used as resolver fallback)
+- Heavy multi-source verification (replaced with a free AniList count check)
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/episodes/{anilist_id}` | Fetch verified metadata for an anime |
-| `GET` | `/api/search?query=...&limit=10` | Search AniList by name |
-| `GET` | `/health` | Service health + per-source stats |
-| `GET` | `/` | Web playground UI |
-| `GET` | `/docs` | OpenAPI / Swagger UI |
+| `GET` | `/api/episodes/{anilist_id}` | Default view — auto-detect the right TMDB season from Fribb's mapping. |
+| `GET` | `/api/episodes/{anilist_id}?season=N` | Explicit TMDB season (N=1, 2, 3, ...). Pass 0 for specials. |
+| `GET` | `/api/episodes/{anilist_id}?include_upcoming=true` | Include episodes with future air dates. Default: only return aired episodes. |
+| `GET` | `/api/episodes/{anilist_id}/extras` | TMDB season 0 (specials / OVAs / recaps) only. |
+| `GET` | `/api/search?query=...&limit=10` | Search AniList by name. |
+| `GET` | `/health` | Service health + per-source stats. |
+| `GET` | `/` | Web playground UI. |
+| `GET` | `/docs` | OpenAPI / Swagger UI. |
+
+## Response shape (truncated)
+
+```jsonc
+{
+  "success": true,
+  "data": {
+    "id": "21355",
+    "title": "Re:ZERO -Starting Life in Another World-",
+    "format": "TV",
+    "year": 2016,
+    "totalEpisodes": 25,            // ← actually returned (sliced + renumbered)
+    "anilistEpisodeCount": 25,      // ← AniList's stated count (for cross-ref)
+    "currentEpisode": 25,
+    "pattern": "pattern_a",          // ← which multi-season pattern was detected
+    "seasons": [                     // ← TMDB seasons summary for the picker
+      {
+        "season_number": 0,
+        "name": "Specials",
+        "air_date": "2016-04-05",
+        "episode_count": 78,
+        "is_specials": true,
+        "anilist_ids": [21355, 100049, 108632, 119661, 163134, 189046]
+      },
+      {
+        "season_number": 1,
+        "name": "Season 1",
+        "air_date": "2016-04-04",
+        "episode_count": 85,
+        "is_specials": false,
+        "anilist_ids": [21355, 100049, 108632, 119661, 163134, 189046],
+        "is_current": true          // ← this AniList entry maps to this season
+      }
+    ],
+    "siblingAnilistIds": [21355, 100049, 108632, 119661, 163134, 189046],
+    "episodes": [
+      {
+        "id": "21355-1",
+        "number": 1,                 // ← renumbered per AniList entry (1..25, not 1..85)
+        "title": "The End of the Beginning and the Beginning of the End",
+        "image": "https://image.tmdb.org/...",
+        "airDate": "2016-04-04",
+        "hasAired": true,
+        "source": "tmdb"
+      }
+      /* ... 24 more ... */
+    ],
+    "mappings": {
+      "anilist_id": 21355,
+      "mal_id": 31240,
+      "anidb_id": 11370,
+      "thetvdb_id": null,
+      "themoviedb_id": {"tv": 65942},
+      "themoviedb_id_resolved": {"type": "tv", "id": 65942, "method": "fribb"}
+    },
+    "sources": {
+      "anilist": true,
+      "fribb": true,
+      "tmdb": true,
+      "tmdb_type": "tv",
+      "resolver_method": "fribb",
+      "resolver_tried": ["fribb"]
+    },
+    "verification": {
+      "field": "episodes",
+      "anilist_count": 25,
+      "returned_count": 25,
+      "match": true,
+      "note": "ok"
+    },
+    "view": {
+      "extras_mode": false,
+      "include_upcoming": false,
+      "explicit_season": 1
+    }
+  },
+  "meta": {
+    "source": "multi",
+    "resolver": "fribb",
+    "pattern": "pattern_a",
+    "cacheTTL": 604800,
+    "cacheStats": {"entries": 0, "default_ttl_seconds": 604800}
+  }
+}
+```
+
+## Architecture
+
+```
+   Stage 1 (parallel):
+       ├─ AniList GraphQL  (1 call) → title, format, year, episodes, season
+       └─ Fribb (in-memory)         → tmdb_id + season.tmdb + episode_offset.tmdb
+                                       (reverse index: TMDB→sibling AniList IDs)
+
+   Stage 2 (only if Fribb missed):
+       AniBridge → TMDB /find by TVDB/IMDb → TMDB /search by name+year → None
+
+   Stage 3 (parallel, only if TMDB ID found):
+       ├─ TMDB TV details   (1 call) → seasons[] for the picker
+       ├─ TMDB TV season(s)  (1+ calls in parallel) → episodes
+       └─ TMDB TV images    (1 call) → logos, backdrops, posters
+
+   Stage 4 (pure-functional, no network):
+       seasons.slice_episodes() — apply offset, count, renumber, filter unaired
+```
+
+## How multi-season detection works (`seasons.py`)
+
+The "own brain" is a pure-functional module that decides which TMDB season(s)
+to fetch and how to slice them. It uses 3 signals in order:
+
+1. **Fribb's `episode_offset.tmdb`** (Pattern A decisive signal):
+   - If Fribb says "AniList 108632 starts at TMDB episode 26", we know AniList
+     has split this anime into multiple entries. Slice `[26..26+count]` from
+     TMDB S1, renumber 1..count.
+
+2. **Sibling discovery via reverse Fribb index**:
+   - If ≥2 AniList IDs map to the same TMDB TV ID, this is a Pattern A series
+     even if THIS entry has no offset (the first entry has offset=0, which
+     Fribb doesn't bother recording).
+
+3. **TMDB `seasons[]` array**:
+   - 1 non-special season → Pattern C (simple).
+   - >1 non-special season + AniList `episodes` is null → Pattern B (fetch all,
+     continuous numbering, filter unaired).
+   - >1 non-special season + AniList `episodes` is a number → try to match by
+     year + episode_count, fall back to Pattern B.
+
+## Episode renumbering
+
+- **Pattern A** (Re:Zero): Each AniList entry starts at episode 1. So Re:Zero S2P1 = eps 1..13 (renumbered from TMDB 26..38). The original TMDB number is preserved in `tmdbEpisodeNumber`.
+- **Pattern B** (One Piece): Continuous TMDB numbering. EP 1 = "I'm Luffy!", EP 1173 = the last aired.
+- **Pattern C** (Cowboy Bebop): 1..N where N = AniList episode count.
+
+## Unaired episode filtering
+
+Default behavior: episodes with `air_date > today` are filtered out.
+
+- One Piece: AniList says `nextAiringEpisode: 1174`. TMDB has episodes up to #2328. We return 1173 aired episodes.
+- Tomb Raider King: AniList says 12 total, only 6 have aired. We return 6 (the unaired 7-12 are dropped).
+- Pass `?include_upcoming=true` to opt into seeing all announced episodes.
 
 ## Run locally
 
@@ -46,176 +208,16 @@ docker run -p 8000:8000 anime-metadata-api
 
 The included `render.yaml` deploys the pre-built image from `ghcr.io/historiesofhistory-arch/anime-metadata-api:latest`. The GitHub Actions workflow in `.github/workflows/docker-publish.yml` rebuilds the image on every push to `main`.
 
-## Architecture
-
-```
-                     ┌─────────────────────────────────────────────────┐
-                     │                aggregator.fetch_all              │
-                     │                                                 │
-   Stage 1 (parallel) ─┬─ AniList GraphQL  ──┐                        │
-                       ├─ AniZip              │                        │
-                       ├─ AniBridge (live)    │                        │
-                       └─ Jikan (MAL)         │                        │
-                                              │                        │
-   Stage 2: Resolver (multi-source) ◄─────────┘                        │
-              AniBridge ─► Fribb ─► TMDB/find ─► TMDB/search ─► None  │
-                                                                       │
-   Stage 3+4 (parallel):                                              │
-       ├─ TMDB (tv/movie details + season episodes + images)          │
-       └─ Kitsu (resolves AniList → Kitsu → episode count + season)    │
-                                                                       │
-   Stage 5: Cross-source verification (verifier.py — "own brain")     │
-       ├─ verify_episode_count()  ← majority vote                     │
-       ├─ verify_season()         ← AniList primary + majority         │
-       └─ verify_status()         ← majority vote                     │
-                                                                       │
-   Stage 6: Merge + return                                            │
-                     └─────────────────────────────────────────────────┘
-```
-
-## Verification logic (`verifier.py`)
-
-The verification module is intentionally **pure-functional** — it makes zero HTTP calls and just operates on the data already fetched by `aggregator.py`. This keeps the "own brain" logic unit-testable and side-effect-free.
-
-### Episode count (`verify_episode_count`)
-
-1. Collect `(value, source, weight)` tuples from every source that returned a non-null, non-zero count.
-2. **Majority vote** — if ≥ 2 distinct sources agree on the same value, that value wins with `confidence = "high"` and the agreeing sources are listed.
-3. If only one source returned data, that value is used with `confidence = "medium"` (or `"medium_low"` if that source was AniList alone, since AniList's `episodes` field is sometimes stale for ongoing shows).
-4. If sources disagree, the discrepancies are surfaced in the response (`verification.episodes.discrepancies`).
-5. AniList's `episodes` field gets a slight weight preference in tie-breaks (per the user's requirement that AniList GraphQL be the verification anchor), but majority always wins outright.
-
-### Season (`verify_season`)
-
-1. Normalise every source's season value to lowercase `winter | spring | summer | fall`.
-2. Sources: AniList (primary), AniBridge (via `release.start_date`), Jikan, Kitsu.
-3. Same majority-vote logic.
-4. If no source has a season but a start-date exists, the season is inferred from the start-date's month.
-5. Year is verified with the same logic.
-
-### Status (`verify_status`)
-
-Same majority-vote logic, normalising every source's status to `FINISHED | RELEASING | NOT_YET_RELEASED | CANCELLED`.
-
-## Response shape (truncated)
-
-```jsonc
-{
-  "success": true,
-  "data": {
-    "id": "154587",
-    "title": "Frieren: Beyond Journey's End",
-    "titleRomaji": "Sousou no Frieren",
-    "titleJa": "葬送のフリーレン",
-    "format": "TV",
-    "year": 2023,
-    "totalEpisodes": 28,                       // ← verdict.value
-    "episodeVerification": {
-      "value": 28,
-      "confidence": "high",
-      "sources": ["anilist", "anibridge", "jikan", "kitsu", "tmdb"],
-      "all_sources": {"anilist": 28, "anibridge": 28, "jikan": 28, "kitsu": 28, "anizip": 28, "tmdb": 28},
-      "discrepancies": [],
-      "method": "majority"
-    },
-    "season": "fall",
-    "seasonYear": 2023,
-    "seasonVerification": { /* ... */ },
-    "status": "FINISHED",
-    "statusVerification": { /* ... */ },
-    "images": [
-      {"coverType": "Banner", "url": "...", "source": "tmdb"},
-      {"coverType": "Poster", "url": "...", "source": "tmdb"},
-      {"coverType": "Clearlogo", "url": "...", "source": "tmdb"}
-    ],
-    "episodes": [
-      {
-        "id": "154587-1",
-        "number": 1,
-        "title": "The Journey's End",
-        "image": "https://image.tmdb.org/...",
-        "airDate": "2023-09-29",
-        "duration": 47,
-        "hasAired": true,
-        "source": "tmdb"
-      }
-      /* ... */
-    ],
-    "mappings": {
-      "anilist_id": 154587,
-      "mal_id": 52991,
-      "anidb_id": 18124,
-      "kitsu_id": 44891,
-      "thetvdb_id": 425268,
-      "themoviedb_id": {"tv": 114461},
-      "themoviedb_id_resolved": {"type": "tv", "id": 114461, "method": "anibridge"}
-    },
-    "sources": {
-      "anilist": true,
-      "anibridge": true,
-      "jikan": true,
-      "kitsu": true,
-      "anizip": true,
-      "fribb": true,
-      "tmdb": true,
-      "tmdb_type": "tv",
-      "resolver_method": "anibridge",
-      "resolver_tried": ["anibridge", "fribb", "tmdb_find_tvdb", "tmdb_search_tv"]
-    },
-    "verification": {
-      "episodes": { /* same as episodeVerification */ },
-      "season":   { /* same as seasonVerification */ },
-      "status":   { /* same as statusVerification */ },
-      "summary": {
-        "episode_count_agreed": true,
-        "season_agreed": true,
-        "status_agreed": true,
-        "sources_with_episode_data": ["anilist","anibridge","jikan","kitsu","anizip","tmdb"],
-        "sources_with_season_data":  ["anilist","anibridge","jikan","kitsu"]
-      }
-    }
-  },
-  "meta": {
-    "source": "multi",
-    "resolver": "anibridge",
-    "cacheTTL": 604800,
-    "cacheStats": {"entries": 0, "default_ttl_seconds": 604800}
-  }
-}
-```
-
-## Why we no longer depend on Fribb alone
-
-In v1, the resolver was:
-
-```
-Fribb (in-memory, ~39% coverage)  →  TMDB /find by TVDB/IMDb  →  TMDB /search by name  →  None
-```
-
-If Fribb was unavailable (failed to download, indexing error, behind on weekly refresh, missing the show), the resolver fell straight to the slow path of TMDB search-by-name, which is unreliable for shows with common titles or romanised vs English name differences.
-
-In v2:
-
-```
-AniBridge (live, cross-DB)  →  Fribb (in-memory)  →  TMDB /find by TVDB/IMDb (AniBridge + Fribb)  →  TMDB /search  →  None
-```
-
-Each tier fills gaps the previous one couldn't:
-- AniBridge is live, community-maintained, and chases all relationship targets to build a complete cross-provider ID table.
-- Fribb is still useful as an in-memory fallback because it has wide coverage and zero network latency.
-- TMDB `/find` still catches the case where neither AniBridge nor Fribb returned a TMDB ID but they returned a TVDB/IMDb ID.
-- TMDB `/search` is the final fallback for brand-new anime that haven't propagated to any mapping DB yet.
-
 ## Caching
 
 Two in-memory TTL caches (`cache.py`):
 
 | Cache | TTL | Purpose |
 |-------|-----|---------|
-| `metadata_cache` | 7 days | Final merged response per AniList ID |
+| `metadata_cache` | 7 days | Final merged response per `(anilist_id, season, include_upcoming, extras)` |
 | `tmdb_id_cache` | 30 days | AniList → TMDB ID + type + resolution method (1 day if resolved via TMDB `/search`, which can be wrong) |
 
-Caches are in-memory only — no database, no disk persistence. They rebuild naturally on restart.
+Cache key includes the `season` + `include_upcoming` + `extras` flags so different views of the same anime don't collide. Warm-cache responses are <1ms.
 
 ## Environment variables
 
@@ -225,13 +227,18 @@ Caches are in-memory only — no database, no disk persistence. They rebuild nat
 | `PYTHONUNBUFFERED` | `1` | Python stdout buffering |
 | `TMDB_API_KEY` | bundled demo key | Override with your own TMDB API key (recommended for production) |
 
-## License
+## Test cases (verified working)
 
-See the repository for license details. Source data licenses:
-
-- AniList — free public API, no key required.
-- AniBridge — community-maintained, see https://github.com/anibridge/anibridge-mappings
-- Fribb/anime-lists — community dataset.
-- Jikan — open-source MAL wrapper.
-- Kitsu — public JSON:API.
-- TMDB — requires attribution per their TOS.
+| AniList ID | Title | Pattern | Expected | Got | ✓ |
+|---|---|---|---|---|---|
+| 21355 | Re:Zero S1 | A | 25 eps | 25 | ✓ |
+| 108632 | Re:Zero S2 Part 1 | A | 13 eps (renumbered from 26-38) | 13 | ✓ |
+| 119661 | Re:Zero S2 Part 2 | A | 12 eps (renumbered from 39-50) | 12 | ✓ |
+| 163134 | Re:Zero S3 | A | 16 eps (renumbered from 51-66) | 16 | ✓ |
+| 21 | One Piece | B | 1173 aired (next: 1174) | 1173 | ✓ |
+| 1 | Cowboy Bebop | C | 26 eps | 26 | ✓ |
+| 5114 | FMA: Brotherhood | C | 64 eps | 64 | ✓ |
+| 154587 | Frieren | A (has S2 sibling) | 28 eps | 28 | ✓ |
+| 199 | Spirited Away | Movie | 1 ep | 1 | ✓ |
+| 184356 | Tomb Raider King | C (ongoing) | 6 aired of 12 | 6 | ✓ |
+| 21355/extras | Re:Zero Extras | Extras | 78 specials | 78 | ✓ |

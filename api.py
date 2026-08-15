@@ -1,26 +1,33 @@
 """
-api.py — Anime Metadata API
+api.py — Anime Metadata API (v3 — lean + fast)
 
 Endpoint: GET /api/episodes/{anilist_id}
 Returns: episode titles, thumbnails, banners, clearlogos, posters, mappings
          for any anime by AniList ID.
 
-Sources (multi-source, fetched in parallel, then cross-verified):
-  1. AniList GraphQL — PRIMARY source for title, format, year, episode count,
-       season, status. (This is the "graph URL" used as the verification anchor.)
-  2. AniBridge — live cross-provider mapping API (AniList↔AniDB↔MAL↔Kitsu↔
-       TMDB↔TVDB↔IMDB). Replaces Fribb as the primary mapping source.
-  3. AniZip (api.ani.zip) — TVDB images + episode data
-  4. TMDB — episodes with stills, logos, backdrops, posters (TV + Movies)
-  5. Jikan (MyAnimeList) — episode count + season + status verifier
-  6. Kitsu — episode count + season + status verifier
-  7. Fribb/anime-lists — secondary fallback AniList↔TMDB static mapping
+Pipeline (3 network calls max — Fribb-first, AniList-verified, TMDB-sliced):
+  1. AniList GraphQL — primary metadata (title, format, year, episodes, season)
+  2. Fribb (in-memory) — AniList↔TMDB mapping + season + episode_offset
+     (falls back to AniBridge → TMDB /find → TMDB /search if Fribb misses)
+  3. TMDB — episodes with stills + images (only the right season, sliced)
 
-The API's "own brain" (verifier.py) cross-checks episode count, season, and
-status across all sources and reports the verdict + confidence + discrepancies.
+The API's "own brain" (seasons.py) handles the 3 multi-season patterns:
+  - Pattern A: 1 TMDB season, multiple AniList entries (Re:Zero — 4 AniList IDs
+    mapped to one 85-episode TMDB S1, each sliced by Fribb's episode_offset)
+  - Pattern B: 1 AniList entry, multiple TMDB seasons (One Piece — 1 AniList ID,
+    23 TMDB seasons, continuous numbering, unaired episodes filtered)
+  - Pattern C: 1 AniList entry, 1 TMDB season (Cowboy Bebop — simple)
+
+Endpoints:
+  GET /api/episodes/{id}                       — default view (auto-detect season)
+  GET /api/episodes/{id}?season=N              — explicit TMDB season (N=1,2,3,...)
+  GET /api/episodes/{id}?include_upcoming=true  — include unaired episodes
+  GET /api/episodes/{id}/extras                — TMDB season 0 (specials/OVAs)
+  GET /api/search?query=...                    — search AniList by name
+  GET /health                                  — service health + stats
 
 100% keyless (uses TMDB's official documentation key + public APIs).
-7-day in-memory cache. No database. Handles TV, movies, OVAs, new anime.
+7-day in-memory cache. No database.
 """
 from __future__ import annotations
 
@@ -38,7 +45,7 @@ from dotenv import load_dotenv
 
 from aggregator import fetch_all
 from cache import metadata_cache, tmdb_id_cache
-from sources import fribb, anilist as anilist_source, anibridge, jikan, kitsu
+from sources import fribb, anilist as anilist_source, anibridge
 
 load_dotenv()
 
@@ -71,8 +78,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Anime Metadata API",
-    version="2.0.0",
-    description="Multi-source anime metadata API with cross-source verification. AniList ID in, verified episode titles/thumbnails/banners/clearlogos/mappings out.",
+    version="3.0.0",
+    description="Lean multi-source anime metadata API with multi-season handling. AniList ID in, sliced+renumbered episodes+mappings out.",
     lifespan=lifespan,
 )
 
@@ -88,41 +95,87 @@ app.add_middleware(
 # ─── API endpoints ──────────────────────────────────────────────────
 
 @app.get("/api/episodes/{anilist_id}")
-async def get_episodes(anilist_id: int):
+async def get_episodes(
+    anilist_id: int,
+    season: Optional[int] = Query(None, ge=0, le=100, description="TMDB season number (1,2,3,...). 0 = specials. Omit for auto-detect."),
+    include_upcoming: bool = Query(False, description="Include episodes with future air dates"),
+):
     """
     Returns episode names, thumbnails, banners, clearlogos, posters, and
     cross-references for any anime by AniList ID.
 
-    Sources (in parallel, then cross-verified):
-      - AniList GraphQL (primary metadata)
-      - AniBridge (cross-provider mapping + verified `units`)
-      - AniZip (TVDB images + episodes)
-      - TMDB (episode stills + images)
-      - Jikan/MAL (episode count + season verifier)
-      - Kitsu (episode count + season verifier)
-      - Fribb (secondary mapping fallback)
+    Pipeline (3 calls max, ~200ms typical):
+      1. AniList GraphQL  → title, format, year, episodes, season
+      2. Fribb (memory)   → tmdb_id + season.tmdb + episode_offset.tmdb
+         (fallback: AniBridge → TMDB /find → TMDB /search)
+      3. TMDB             → episodes + images (sliced to the right season)
 
-    All fetched in parallel. Cached for 7 days.
-    The response includes a `verification` block showing the confidence +
-    discrepancies of each cross-checked field.
+    Query params:
+      season=N            — fetch TMDB season N explicitly (1, 2, 3, ...).
+                            Pass 0 for specials (same as /extras).
+      include_upcoming    — include episodes whose air_date > today.
+                            Default: only return episodes that have aired.
+
+    Cached for 7 days.
     """
     if anilist_id <= 0:
         raise HTTPException(status_code=400, detail="anilist_id must be a positive integer")
 
     try:
-        data = await fetch_all(anilist_id)
+        data = await fetch_all(
+            anilist_id,
+            season=season,
+            include_upcoming=include_upcoming,
+            extras=False,
+        )
         return {
             "success": True,
             "data": data,
             "meta": {
                 "source": "multi",
                 "resolver": data.get("sources", {}).get("resolver_method"),
+                "pattern": data.get("pattern"),
                 "cacheTTL": 604800,
                 "cacheStats": metadata_cache.stats(),
             },
         }
     except Exception as e:
         log.exception("Failed to fetch %d", anilist_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/episodes/{anilist_id}/extras")
+async def get_extras(
+    anilist_id: int,
+    include_upcoming: bool = Query(False, description="Include upcoming specials"),
+):
+    """
+    Returns TMDB season 0 (specials / OVAs / recaps) for an anime.
+
+    Same pipeline as /api/episodes/{id} but forces TMDB season 0.
+    """
+    if anilist_id <= 0:
+        raise HTTPException(status_code=400, detail="anilist_id must be a positive integer")
+    try:
+        data = await fetch_all(
+            anilist_id,
+            season=0,
+            include_upcoming=include_upcoming,
+            extras=True,
+        )
+        return {
+            "success": True,
+            "data": data,
+            "meta": {
+                "source": "extras",
+                "resolver": data.get("sources", {}).get("resolver_method"),
+                "pattern": data.get("pattern"),
+                "cacheTTL": 604800,
+                "cacheStats": metadata_cache.stats(),
+            },
+        }
+    except Exception as e:
+        log.exception("Failed to fetch extras for %d", anilist_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -182,8 +235,6 @@ async def health():
         "sources": {
             "fribb": fribb.stats(),
             "anibridge": anibridge.stats(),
-            "jikan": jikan.stats(),
-            "kitsu": kitsu.stats(),
         },
         "caches": {
             "metadata_cache": metadata_cache.stats(),
@@ -272,13 +323,13 @@ footer a{color:var(--blue);text-decoration:none}
 <div class="container">
   <header>
     <h1>Anime Metadata API</h1>
-    <p>Enter an AniList ID to get episode titles, thumbnails, banners, clearlogos, and cross-references. Multi-source + cross-verified: AniList GraphQL (primary) + AniBridge + Jikan/MAL + Kitsu + AniZip + TMDB + Fribb.</p>
+    <p>Enter an AniList ID to get episode titles, thumbnails, banners, clearlogos, and cross-references. Lean 3-call pipeline (AniList GraphQL + Fribb + TMDB) with multi-season handling.</p>
     <div class="badges">
       <span class="badge live">Live</span>
       <span class="badge">100% keyless</span>
       <span class="badge">TV + Movies</span>
       <span class="badge">7-day cache</span>
-      <span class="badge">Cross-source verified</span>
+      <span class="badge">Multi-season aware</span>
     </div>
   </header>
 
@@ -290,14 +341,15 @@ footer a{color:var(--blue);text-decoration:none}
 
   <div class="test-buttons">
     <span style="color:var(--muted);font-size:.8rem;align-self:center;margin-right:4px">Quick test:</span>
-    <button onclick="quickTest(154587)">Frieren (TV)</button>
-    <button onclick="quickTest(21)">One Piece (TV)</button>
-    <button onclick="quickTest(184356)">Tomb Raider King (new)</button>
+    <button onclick="quickTest(21355)">Re:Zero S1 (Pattern A)</button>
+    <button onclick="quickTest(108632)">Re:Zero S2 Part 1</button>
+    <button onclick="quickTest(119661)">Re:Zero S2 Part 2</button>
+    <button onclick="quickTest(163134)">Re:Zero S3</button>
+    <button onclick="quickTest(21)">One Piece (Pattern B)</button>
+    <button onclick="quickTest(1)">Cowboy Bebop (Pattern C)</button>
+    <button onclick="quickTest(5114)">FMA: Brotherhood</button>
+    <button onclick="quickTest(154587)">Frieren</button>
     <button onclick="quickTest(199)">Spirited Away (Movie)</button>
-    <button onclick="quickTest(164)">Princess Mononoke (Movie)</button>
-    <button onclick="quickTest(101922)">Demon Slayer</button>
-    <button onclick="quickTest(1)">Cowboy Bebop</button>
-    <button onclick="quickTest(5114)">Fullmetal Alchemist: Brotherhood</button>
   </div>
 
   <div id="status" class="status" style="display:none"></div>
@@ -311,19 +363,35 @@ footer a{color:var(--blue);text-decoration:none}
 <script>
 const API = '';
 
-async function fetchData() {
+async function fetchData(opts = {}) {
   const id = document.getElementById('anilistId').value.trim();
   if (!id) { showStatus('error', 'Please enter an AniList ID'); return; }
-  showStatus('loading', `Fetching metadata for AniList ID ${id}...`);
+  const qs = new URLSearchParams();
+  if (opts.season !== undefined) qs.set('season', opts.season);
+  if (opts.include_upcoming) qs.set('include_upcoming', 'true');
+  if (opts.extras) {
+    showStatus('loading', `Fetching extras for AniList ID ${id}...`);
+  } else {
+    showStatus('loading', `Fetching metadata for AniList ID ${id}...`);
+  }
   document.getElementById('result').innerHTML = '';
   try {
-    const r = await fetch(`${API}/api/episodes/${id}`);
+    const url = opts.extras
+      ? `${API}/api/episodes/${id}/extras${qs.toString() ? '?' + qs : ''}`
+      : `${API}/api/episodes/${id}${qs.toString() ? '?' + qs : ''}`;
+    const t0 = performance.now();
+    const r = await fetch(url);
     const d = await r.json();
+    const dt = Math.round(performance.now() - t0);
     if (!r.ok || !d.success) {
       showStatus('error', d.detail || `HTTP ${r.status}`);
       return;
     }
-    showStatus('success', `✅ Loaded — resolver: ${d.meta.resolver || 'n/a'} · ${d.data.verification ? d.data.verification.summary.episode_count_agreed ? 'episodes verified ✓' : 'episode count discrepancy ⚠' : ''}`);
+    const v = d.data.verification || {};
+    const verifNote = v.match === true ? '✓ verified'
+                    : v.match === false ? '⚠ mismatch'
+                    : '—';
+    showStatus('success', `✅ Loaded in ${dt}ms — pattern: ${d.meta.pattern || '?'} · ${verifNote}`);
     renderResult(d.data);
   } catch(e) {
     showStatus('error', 'Network error: ' + e.message);
@@ -383,35 +451,64 @@ function renderResult(data) {
   // Sources
   html += '<div class="meta" style="margin-top:8px;font-size:.72rem">';
   const s = data.sources || {};
-  html += `<span>Resolver: ${s.resolver_method || '?'} ${s.resolver_tried ? '(' + s.resolver_tried.join('→') + ')' : ''}</span>`;
+  html += `<span>Resolver: ${s.resolver_method || '?'} ${s.resolver_tried && s.resolver_tried.length ? '(' + s.resolver_tried.join('→') + ')' : ''}</span>`;
   if (s.anilist) html += `<span style="color:var(--green)">AniList ✓</span>`;
-  if (s.anibridge) html += `<span style="color:var(--green)">AniBridge ✓</span>`;
-  if (s.jikan) html += `<span style="color:var(--green)">Jikan/MAL ✓</span>`;
-  if (s.kitsu) html += `<span style="color:var(--green)">Kitsu ✓</span>`;
-  if (s.anizip) html += `<span style="color:var(--green)">AniZip ✓</span>`;
   if (s.fribb) html += `<span style="color:var(--green)">Fribb ✓</span>`;
   if (s.tmdb) html += `<span style="color:var(--green)">TMDB ✓</span>`;
+  html += `<span>Pattern: ${data.pattern || '?'}</span>`;
   html += '</div>';
 
-  // Verification block
+  // Seasons picker — show all TMDB seasons, let user click to switch
+  if (data.seasons && data.seasons.length) {
+    html += '<div class="meta" style="margin-top:8px;font-size:.74rem;flex-wrap:wrap">';
+    html += `<span style="color:var(--muted)">Seasons (${data.seasons.length}):</span>`;
+    data.seasons.forEach(sn => {
+      const isCurrent = sn.is_current;
+      const label = sn.is_specials ? 'Specials' : `S${sn.season_number}`;
+      const tip = `${sn.name} · ${sn.episode_count} eps · ${sn.air_date || '?'}`;
+      const style = isCurrent
+        ? 'background:var(--blue);color:white;border-color:var(--blue)'
+        : 'background:var(--surface);color:var(--text);border:1px solid var(--border)';
+      html += `<button onclick="fetchData({season: ${sn.season_number}})" `
+        + `style="padding:3px 10px;font-size:.72rem;border-radius:6px;cursor:pointer;${style}" title="${tip}">`
+        + `${label}${isCurrent ? ' ●' : ''}`
+        + `</button>`;
+    });
+    // Extras button (always available if there's a specials season)
+    const hasSpecials = data.seasons.some(s => s.is_specials);
+    if (hasSpecials && !(data.view && data.view.extras_mode)) {
+      html += `<button onclick="fetchData({extras: true})" `
+        + `style="padding:3px 10px;font-size:.72rem;border-radius:6px;cursor:pointer;background:rgba(245,158,11,.15);color:var(--amber);border:1px solid rgba(245,158,11,.3)" title="Specials / OVAs / recaps">`
+        + `🎁 Extras`
+        + `</button>`;
+    }
+    html += '</div>';
+  }
+
+  // Sibling AniList IDs (Pattern A: this TMDB series has multiple AniList entries)
+  if (data.siblingAnilistIds && data.siblingAnilistIds.length > 1) {
+    html += '<div class="meta" style="margin-top:8px;font-size:.74rem">';
+    html += `<span style="color:var(--muted)">Sibling AniList IDs (same TMDB series):</span>`;
+    data.siblingAnilistIds.forEach(aid => {
+      const isUs = String(aid) === String(data.id);
+      html += `<button onclick="quickTest(${aid})" `
+        + `style="padding:3px 10px;font-size:.72rem;border-radius:6px;cursor:pointer;${isUs ? 'background:var(--green);color:white;border-color:var(--green)' : 'background:var(--surface);color:var(--text);border:1px solid var(--border)'}">`
+        + `${aid}${isUs ? ' (you are here)' : ''}`
+        + `</button>`;
+    });
+    html += '</div>';
+  }
+
+  // Verification block (lightweight — AniList count vs returned count)
   if (data.verification) {
     const v = data.verification;
-    const summary = v.summary || {};
-    const confColor = (ok) => ok ? 'var(--green)' : 'var(--amber)';
+    const okColor = v.match === true ? 'var(--green)' : v.match === false ? 'var(--red)' : 'var(--muted)';
+    const okLabel = v.match === true ? '✓ verified' : v.match === false ? '✗ mismatch' : '—';
     html += `<div style="margin-top:10px;padding:10px;background:rgba(0,0,0,.25);border-radius:8px;font-size:.74rem">`;
-    html += `<div style="color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Cross-source verification</div>`;
-    const ev = v.episodes || {};
-    html += `<div style="display:flex;gap:10px;flex-wrap:wrap">`;
-    html += `<span style="color:${confColor(summary.episode_count_agreed)}">Episodes: ${ev.value ?? '?'} (${ev.confidence ?? '?'}) — ${(ev.sources||[]).join('+')||'no data'}</span>`;
-    const sv = v.season || {};
-    html += `<span style="color:${confColor(summary.season_agreed)}">Season: ${sv.season ?? '?'} ${sv.year ?? ''} (${sv.confidence ?? '?'})</span>`;
-    const stv = v.status || {};
-    html += `<span style="color:${confColor(summary.status_agreed)}">Status: ${stv.value ?? '?'} (${stv.confidence ?? '?'})</span>`;
-    html += `</div>`;
-    // Discrepancies detail
-    if (ev.discrepancies && ev.discrepancies.length) {
-      html += `<div style="margin-top:6px;color:var(--amber)">Episode count discrepancies: ` +
-        ev.discrepancies.map(d => `${d.source}=${d.value}`).join(', ') + `</div>`;
+    html += `<div style="color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Episode count verification</div>`;
+    html += `<div style="color:${okColor}">AniList: ${v.anilist_count ?? '?'} · Returned: ${v.returned_count ?? '?'} · ${okLabel}</div>`;
+    if (v.note && v.note !== 'ok') {
+      html += `<div style="margin-top:4px;color:var(--amber);font-size:.7rem">${v.note}</div>`;
     }
     html += `</div>`;
   }
