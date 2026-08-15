@@ -207,6 +207,16 @@ async def _fetch_all_impl(
         pattern = "not_found"
 
     # ── Stage 4: Slice + renumber + filter (pure-functional) ───────
+    # AniList's nextAiringEpisode.episode tells us what's "next to air" — so
+    # episodes 1..next_airing-1 are the actually-aired ones. We pass this as a
+    # cap to slice_episodes so we don't return TMDB's extra episodes that have
+    # future air dates (e.g. Doraemon 2005: AniList says next=929, TMDB has
+    # 1464 "aired" episodes including recaps).
+    anilist_next_airing = None
+    nae = (anilist_data or {}).get("nextAiringEpisode") or {}
+    if isinstance(nae, dict):
+        anilist_next_airing = nae.get("episode")
+
     if tmdb_type == "tv":
         sliced = slice_episodes(
             tmdb_episodes,
@@ -215,6 +225,7 @@ async def _fetch_all_impl(
             continuous_numbering=continuous_numbering,
             include_upcoming=include_upcoming,
             anilist_id=anilist_id,
+            anilist_next_airing=anilist_next_airing,
         )
     else:
         # Movies: just one "episode" (already built above)

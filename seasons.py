@@ -195,7 +195,29 @@ def resolve_target_season(
         season_numbers = [s["season_number"] for s in tmdb_seasons]
         return _result(season_numbers, 0, None, "pattern_b", True)
 
-    # AniList gave us an episode count — try to match it to one TMDB season
+    # AniList gave us an episode count — check if it equals the SUM of all TMDB
+    # seasons' episode_counts. If yes, this is Pattern B (e.g. Naruto: AniList=220,
+    # TMDB has 4 seasons summing to 220). Don't try to match a single season.
+    total_tmdb_eps = sum(s.get("episode_count", 0) or 0 for s in tmdb_seasons)
+    if anilist_eps == total_tmdb_eps:
+        season_numbers = [s["season_number"] for s in tmdb_seasons]
+        return _result(season_numbers, 0, anilist_eps, "pattern_b", True)
+
+    # AniList count is between 1 and total_tmdb_eps — maybe AniList is a subset
+    # (e.g. Doraemon 2005: AniList says next=929, but TMDB has 1464 "aired" eps).
+    # In this case, we fetch all seasons and cap at anilist_eps.
+    if anilist_eps > 0 and anilist_eps < total_tmdb_eps:
+        season_numbers = [s["season_number"] for s in tmdb_seasons]
+        return _result(season_numbers, 0, anilist_eps, "pattern_b", True)
+
+    # AniList count > total TMDB eps — TMDB might be incomplete; fetch all and
+    # return what we have (cap at anilist_eps to allow growth).
+    if anilist_eps > total_tmdb_eps:
+        season_numbers = [s["season_number"] for s in tmdb_seasons]
+        return _result(season_numbers, 0, None, "pattern_b", True)
+
+    # Try matching to a single TMDB season (Pattern A inferred — split-cour where
+    # Fribb didn't have offset info)
     best_season = _match_anilist_to_tmdb_season(
         tmdb_seasons, anilist_eps=anilist_eps, anilist_year=anilist_year,
     )
@@ -203,7 +225,6 @@ def resolve_target_season(
         return _result([best_season], 0, anilist_eps, "pattern_a_inferred", False)
 
     # Couldn't match a single season — fetch ALL non-special seasons (Pattern B)
-    # but cap at anilist_eps (in case TMDB has more episodes than AniList says)
     season_numbers = [s["season_number"] for s in tmdb_seasons]
     return _result(season_numbers, 0, anilist_eps, "pattern_b", True)
 
@@ -216,6 +237,7 @@ def slice_episodes(
     continuous_numbering: bool = False,
     include_upcoming: bool = False,
     anilist_id: int,
+    anilist_next_airing: Optional[int] = None,
 ) -> list[dict]:
     """
     Apply offset, count, renumbering, and unaired-episode filtering to a list
@@ -234,6 +256,11 @@ def slice_episodes(
             this AniList entry (e.g. Re:Zero S2 starts at 1, not 26).
         include_upcoming: False (default) = drop episodes whose air_date > today.
         anilist_id: used to build the episode ID.
+        anilist_next_airing: AniList's `nextAiringEpisode.episode` value.
+            If set, we cap the returned episodes at (anilist_next_airing - 1)
+            because that's AniList's authoritative "last aired" episode.
+            This catches the case where TMDB has future-dated episodes that
+            are actually recaps/specials/announcements (e.g. Doraemon 2005).
     """
     if not tmdb_episodes:
         return []
@@ -271,6 +298,21 @@ def slice_episodes(
             new_number = ep.get("number", new_idx)
         else:
             new_number = new_idx
+
+        # ── Cap by AniList's nextAiringEpisode ──
+        # AniList says "next episode to air is N" → that means episodes 1..N-1
+        # have aired. If we've already returned N-1 episodes, stop. This catches
+        # cases where TMDB has extra episodes (recaps, multi-part specials, etc.)
+        # that aren't real AniList episodes.
+        if anilist_next_airing and anilist_next_airing > 0:
+            if continuous_numbering:
+                # Continuous: episode number = TMDB's number. Cap at next_airing-1.
+                if ep.get("number", 0) >= anilist_next_airing:
+                    continue
+            else:
+                # Per-entry renumbered: cap at next_airing-1 in the renumbered space.
+                if new_number >= anilist_next_airing:
+                    continue
 
         new_ep = dict(ep)  # shallow copy
         new_ep["number"] = new_number
