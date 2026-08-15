@@ -71,22 +71,30 @@ def _empty(anilist_id: int) -> dict:
 
 
 def _normalize(raw: dict, anilist_id: int) -> dict:
-    """Convert AniZip response to our standard format."""
+    """Convert AniZip response to our standard format.
+
+    AniZip returns episodes for a SPECIFIC AniList ID — each AniList entry
+    maps to its own set of episodes (e.g. Re:Zero S2P1 gets 13 eps, S2P2
+    gets 12 eps). The episodes may have seasonNumber > 1 (TVDB's season
+    numbering), but that's fine — we want ALL of them.
+
+    We skip specials (keys starting with "S" like "S1", "S2", etc.) and
+    keep only the main episodes (keys that are pure numbers).
+    """
     titles = raw.get("titles", {}) or {}
     episodes_map = raw.get("episodes", {}) or {}
     images = raw.get("images", []) or []
     mappings = raw.get("mappings", {}) or {}
 
-    # Build episodes list (only S01E* — skip specials)
+    # Build episodes list — keep ALL main episodes (numeric keys only).
+    # Skip specials (keys like "S1", "S2", "S8", etc.)
     episodes = []
     today = time.strftime("%Y-%m-%d")
     for ep_key in sorted(episodes_map.keys(), key=lambda k: int(k) if k.isdigit() else 99999):
+        if not ep_key.isdigit():
+            continue  # Skip specials (S1, S2, etc.)
         ep = episodes_map[ep_key]
-        if ep.get("seasonNumber", 1) != 1:
-            continue
-        num = ep.get("absoluteEpisodeNumber") or ep.get("episodeNumber")
-        if num is None:
-            continue
+        num = ep.get("absoluteEpisodeNumber") or ep.get("episodeNumber") or int(ep_key)
         ep_titles = ep.get("title", {}) or {}
         air_date = ep.get("airDate", "") or ""
         episodes.append({

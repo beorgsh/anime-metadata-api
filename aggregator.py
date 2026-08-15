@@ -34,9 +34,11 @@ import httpx
 
 from cache import metadata_cache, offset_cache
 from sources import anilist, anizip, fribb, tmdb
+from sources.anizip import fetch_anizip as _fetch_anizip
 from resolver import resolve_tmdb_id
 from seasons import (
     detect_pattern,
+    _safe_int,
     resolve_target_season,
     slice_episodes,
     get_seasons_summary,
@@ -113,6 +115,11 @@ async def _fetch_all_impl(
             anilist_data, anilist_relations = await anilist.fetch_anilist_with_relations(anilist_id, client)
 
     fribb_data = fribb.lookup(anilist_id) if fribb.is_loaded() else None
+    fribb_season = None
+    fribb_offset = 0
+    if fribb_data:
+        fribb_season = (fribb_data.get('season') or {}).get('tmdb')
+        fribb_offset = (fribb_data.get('episode_offset') or {}).get('tmdb') or 0
 
     # ── Stage 2: Resolve TMDB ID (Fribb-first, with fallbacks) ─────
     tmdb_resolution = await resolve_tmdb_id(anilist_id, anilist_data, fribb_data)
@@ -130,12 +137,18 @@ async def _fetch_all_impl(
     slice_count: Optional[int] = None
     continuous_numbering = False
     pattern = "not_found"
-    anilist_relations_used = False  # track if we used the relations from Stage 1
+    anilist_relations_used = False
+    anilist_next_airing = None
+    _nae = (anilist_data or {}).get('nextAiringEpisode') or {}
+    if isinstance(_nae, dict):
+        anilist_next_airing = _nae.get('episode')
 
     if tmdb_type == "tv" and tmdb_id:
+        target_seasons = []
+        season_results = []
         # Use a context manager only if we don't have a shared client
         async def _do_tmdb_fetch(client: httpx.AsyncClient):
-            nonlocal tmdb_episodes, tmdb_images, tmdb_details, slice_offset, slice_count, continuous_numbering, pattern, anilist_relations_used
+            nonlocal tmdb_episodes, tmdb_images, tmdb_details, slice_offset, slice_count, continuous_numbering, pattern, anilist_relations_used, target_seasons, season_results
 
             details_task = asyncio.create_task(tmdb.fetch_tv(tmdb_id, client))
             images_task = asyncio.create_task(tmdb.fetch_tv_images(tmdb_id, client))
@@ -167,6 +180,63 @@ async def _fetch_all_impl(
                     explicit_season=season,
                     calculated_offset=None,  # try without chain offset first
                 )
+
+                # AniZip (TVDB) fallback for Pattern A critical cases
+
+                anizip_provided = False
+
+                _is_pa = bool(fribb_offset) or bool(fribb_season)
+
+                if not _is_pa:
+
+                    _te = (anilist_data.get('title') or {}).get('english') or ''
+
+                    _tr = (anilist_data.get('title') or {}).get('romaji') or ''
+
+                    from seasons import detect_season_from_title as _dst
+
+                    if _dst(_te) or _dst(_tr):
+
+                        _is_pa = True
+
+                if _is_pa:
+
+                    try:
+
+                        _az = await _fetch_anizip(anilist_id, client)
+
+                        if _az and _az.get('episodes'):
+
+                            _az_eps = _az['episodes']
+
+                            if len(_az_eps) >= 1:
+
+                                pattern = 'pattern_a_anizip'
+
+                                tmdb_episodes = list(_az_eps)
+
+                                if anilist_next_airing and anilist_next_airing > 0:
+
+                                    _td = time.strftime('%Y-%m-%d')
+
+                                    tmdb_episodes = [ep for ep in tmdb_episodes
+
+                                        if ep.get('number', 0) < anilist_next_airing
+
+                                        or (ep.get('airDate', '') and ep.get('airDate') <= _td)]
+
+                                slice_offset = 0
+
+                                slice_count = None
+
+                                continuous_numbering = False
+
+                                anizip_provided = True
+
+                    except Exception as e:
+
+                        log.warning('AniZip fetch for %d failed: %s', anilist_id, e)
+
 
                 # Quick check: do we need the chain offset?
                 title_en = (anilist_data.get("title") or {}).get("english") or ""
@@ -222,6 +292,8 @@ async def _fetch_all_impl(
                 pattern = decision["pattern"]
                 continuous_numbering = decision["continuous_numbering"]
 
+            if anizip_provided:
+                target_seasons = []
             # Fetch all required TMDB seasons in parallel
             season_tasks = [
                 asyncio.create_task(tmdb.fetch_tv_season(tmdb_id, s, client))
