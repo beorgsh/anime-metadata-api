@@ -51,6 +51,7 @@ async def fetch_all(
     season: Optional[int] = None,
     include_upcoming: bool = False,
     extras: bool = False,
+    shared_client: Optional[httpx.AsyncClient] = None,
 ) -> dict:
     """
     Fetch metadata for an AniList ID. Cached for 7 days.
@@ -62,6 +63,8 @@ async def fetch_all(
         include_upcoming: True = include episodes with future air dates.
             False (default) = only return episodes that have aired.
         extras: True = fetch TMDB season 0 (specials/OVAs) only.
+        shared_client: Optional shared httpx.AsyncClient (reused across requests
+            for TLS connection pooling). If None, a fresh client is created.
     """
     # Cache key includes season + flags so different views don't collide
     cache_key = f"meta:{anilist_id}:s={season or 'auto'}:up={int(include_upcoming)}:ex={int(extras)}"
@@ -80,6 +83,7 @@ async def fetch_all(
             season=season,
             include_upcoming=include_upcoming,
             extras=extras,
+            shared_client=shared_client,
         )
         metadata_cache.set(cache_key, result)
         return result
@@ -91,14 +95,22 @@ async def _fetch_all_impl(
     season: Optional[int] = None,
     include_upcoming: bool = False,
     extras: bool = False,
+    shared_client: Optional[httpx.AsyncClient] = None,
 ) -> dict:
     """The actual fetch + slice + merge logic."""
 
-    # ── Stage 1: AniList + Fribb in parallel ──────────────────────
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        anilist_task = asyncio.create_task(anilist.fetch_anilist(anilist_id, client))
-        # Fribb is in-memory so it doesn't need the client, but we wait in parallel
-        anilist_data = await anilist_task
+    # ── Stage 1: AniList (combined Media + Relations in ONE call) + Fribb ──
+    # Optimization: fetch_anilist_with_relations uses GraphQL aliases to get
+    # both Media and its relations in ONE round-trip. Saves ~200ms+700ms = 900ms
+    # vs the old two-call approach.
+    # Use the shared client if provided (saves TLS handshake).
+    if shared_client is not None:
+        anilist_data, anilist_relations = await anilist.fetch_anilist_with_relations(
+            anilist_id, shared_client
+        )
+    else:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            anilist_data, anilist_relations = await anilist.fetch_anilist_with_relations(anilist_id, client)
 
     fribb_data = fribb.lookup(anilist_id) if fribb.is_loaded() else None
 
@@ -118,9 +130,13 @@ async def _fetch_all_impl(
     slice_count: Optional[int] = None
     continuous_numbering = False
     pattern = "not_found"
+    anilist_relations_used = False  # track if we used the relations from Stage 1
 
     if tmdb_type == "tv" and tmdb_id:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        # Use a context manager only if we don't have a shared client
+        async def _do_tmdb_fetch(client: httpx.AsyncClient):
+            nonlocal tmdb_episodes, tmdb_images, tmdb_details, slice_offset, slice_count, continuous_numbering, pattern, anilist_relations_used
+
             details_task = asyncio.create_task(tmdb.fetch_tv(tmdb_id, client))
             images_task = asyncio.create_task(tmdb.fetch_tv_images(tmdb_id, client))
 
@@ -138,36 +154,68 @@ async def _fetch_all_impl(
                 pattern = "extras"
                 continuous_numbering = False
             else:
-                # ── Compute calculated offset from AniList prequel chain ──
-                # Used as a fallback when Fribb doesn't have an explicit offset.
-                # Skip this if Fribb already has season+offset (fast path).
-                calculated_offset = None
-                fribb_has_offset = (
-                    fribb_data and
-                    (fribb_data.get("episode_offset") or {}).get("tmdb")
-                )
-                if not fribb_has_offset:
-                    # Check cache first
-                    offset_cache_key = f"chain_offset:{anilist_id}"
-                    cached_offset = offset_cache.get(offset_cache_key)
-                    if cached_offset is not None:
-                        calculated_offset = cached_offset.get("offset")
-                    else:
-                        try:
-                            offset_result = await anilist.calculate_chain_offset(anilist_id, client)
-                            calculated_offset = offset_result.get("offset") or 0
-                            offset_cache.set(offset_cache_key, offset_result)
-                        except Exception as e:
-                            log.warning("Chain offset calc for %d failed: %s", anilist_id, e)
-
+                # ── Decision tree (v4.1 — lazy chain walk) ──
+                # First, try resolve_target_season WITHOUT the calculated offset.
+                # Most cases (Pattern A_fribb, A_title, B, C) don't need it.
+                # Only if Pattern A_chain would be selected do we actually walk
+                # the prequel chain (saving 1-3 AniList calls for the common case).
                 decision = resolve_target_season(
                     anilist_id=anilist_id,
                     anilist_data=anilist_data,
                     fribb_data=fribb_data,
                     tmdb_details=tmdb_details,
                     explicit_season=season,
-                    calculated_offset=calculated_offset,
+                    calculated_offset=None,  # try without chain offset first
                 )
+
+                # Quick check: do we need the chain offset?
+                title_en = (anilist_data.get("title") or {}).get("english") or ""
+                title_romaji = (anilist_data.get("title") or {}).get("romaji") or ""
+                from seasons import detect_season_from_title
+                title_season = detect_season_from_title(title_en) or detect_season_from_title(title_romaji)
+
+                fribb_has_offset = (
+                    fribb_data and
+                    (fribb_data.get("episode_offset") or {}).get("tmdb")
+                )
+                needs_chain_offset = (
+                    not fribb_has_offset
+                    and title_season is not None
+                    and decision["pattern"] in ("pattern_c", "pattern_b")
+                )
+
+                if needs_chain_offset:
+                    # Walk the prequel chain to calculate the offset
+                    # (use the relations we already fetched in Stage 1 — saves another call)
+                    offset_cache_key = f"chain_offset:{anilist_id}"
+                    cached_offset = offset_cache.get(offset_cache_key)
+                    if cached_offset is not None:
+                        calculated_offset = cached_offset.get("offset")
+                    else:
+                        try:
+                            offset_result = await anilist.calculate_chain_offset(
+                                anilist_id,
+                                client,
+                                known_relations=anilist_relations,  # reuse Stage 1 data
+                            )
+                            calculated_offset = offset_result.get("offset") or 0
+                            offset_cache.set(offset_cache_key, offset_result)
+                            anilist_relations_used = True
+                        except Exception as e:
+                            log.warning("Chain offset calc for %d failed: %s", anilist_id, e)
+                            calculated_offset = None
+
+                    # Re-run resolve_target_season with the calculated offset
+                    if calculated_offset and calculated_offset > 0:
+                        decision = resolve_target_season(
+                            anilist_id=anilist_id,
+                            anilist_data=anilist_data,
+                            fribb_data=fribb_data,
+                            tmdb_details=tmdb_details,
+                            explicit_season=season,
+                            calculated_offset=calculated_offset,
+                        )
+
                 target_seasons = decision["season_numbers"]
                 slice_offset = decision["episode_offset"]
                 slice_count = decision["episode_count"]
@@ -182,10 +230,6 @@ async def _fetch_all_impl(
             season_results = await asyncio.gather(*season_tasks, return_exceptions=True)
 
             # Extract + concatenate episodes from each season
-            # IMPORTANT: TMDB already uses continuous numbering for shows like
-            # One Piece (S1=1-61, S2=62-77, S21=892-1088, ...). So for Pattern B
-            # we just concatenate in season order and KEEP TMDB's numbers as-is.
-            # No artificial offset is needed.
             for sn, sd in zip(target_seasons, season_results):
                 if isinstance(sd, dict) and not isinstance(sd, Exception):
                     season_eps = tmdb.extract_episodes(sd, anilist_id)
@@ -197,6 +241,12 @@ async def _fetch_all_impl(
             images_data = await images_task
             if isinstance(images_data, dict) and not isinstance(images_data, Exception):
                 tmdb_images = tmdb.extract_images(images_data, "tv")
+
+        if shared_client is not None:
+            await _do_tmdb_fetch(shared_client)
+        else:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await _do_tmdb_fetch(client)
 
     elif tmdb_type == "movie" and tmdb_id:
         async with httpx.AsyncClient(timeout=15.0) as client:

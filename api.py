@@ -55,13 +55,16 @@ log = logging.getLogger("api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Download + load Fribb mapping data at startup."""
+    """Download + load Fribb mapping data at startup, plus shared HTTP client."""
     log.info("Loading Fribb AniList↔TMDB mapping data...")
     # Run in thread pool to not block event loop
     loop = asyncio.get_event_loop()
     ok = await loop.run_in_executor(None, fribb.ensure_loaded)
     if ok:
         log.info("Fribb loaded: %s", fribb.stats())
+        # Pre-build the reverse index so the first request doesn't pay for it
+        # (~200ms one-time cost moved to startup instead of first request).
+        loop.run_in_executor(None, fribb.lookup_siblings_by_tmdb_tv, 0)
     else:
         log.warning("Fribb failed to load — will use TMDB search fallback only")
 
@@ -73,7 +76,24 @@ async def lifespan(app: FastAPI):
             await loop.run_in_executor(None, fribb.ensure_loaded, True)
 
     asyncio.create_task(refresh_fribb())
+
+    # ── Shared httpx.AsyncClient (reused across all requests) ──────────
+    # Saves TLS handshake overhead (~100ms) per request. This is significant
+    # for the AniList + TMDB calls (3-5 per request).
+    log.info("Creating shared httpx.AsyncClient...")
+    import httpx as _httpx
+    app.state.http_client = _httpx.AsyncClient(
+        timeout=_httpx.Timeout(15.0),
+        limits=_httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        headers={"User-Agent": "anime-metadata-api/4.1"},
+    )
+    log.info("Shared HTTP client ready")
+
     yield
+
+    # Cleanup
+    log.info("Closing shared HTTP client...")
+    await app.state.http_client.aclose()
 
 
 app = FastAPI(
@@ -122,11 +142,14 @@ async def get_episodes(
         raise HTTPException(status_code=400, detail="anilist_id must be a positive integer")
 
     try:
+        # Pass the shared HTTP client for connection pooling (saves TLS handshake)
+        shared_client = getattr(app.state, 'http_client', None)
         data = await fetch_all(
             anilist_id,
             season=season,
             include_upcoming=include_upcoming,
             extras=False,
+            shared_client=shared_client,
         )
         return {
             "success": True,
@@ -157,11 +180,13 @@ async def get_extras(
     if anilist_id <= 0:
         raise HTTPException(status_code=400, detail="anilist_id must be a positive integer")
     try:
+        shared_client = getattr(app.state, 'http_client', None)
         data = await fetch_all(
             anilist_id,
             season=0,
             include_upcoming=include_upcoming,
             extras=True,
+            shared_client=shared_client,
         )
         return {
             "success": True,
