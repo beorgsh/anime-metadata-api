@@ -11,9 +11,11 @@ PATTERN A — "single TMDB season, multiple AniList entries"
     separate AniList IDs but all map to TMDB 65942 with one 85-episode S1).
 
     Detection:
-      - Fribb's `themoviedb_id.tv` is the same for ≥2 different AniList IDs.
-      - Fribb's `episode_offset.tmdb` is present (e.g. 26 for S2P1, 38 for S2P2).
-      - AniList's `episodes` count is small (e.g. 25 for S1).
+      - Fribb's `episode_offset.tmdb` is present (most reliable signal).
+      - OR: AniList title contains "Season N" / "Nth Season" / "Part N" /
+        "Cour N", AND TMDB has a season N to fetch.
+      - OR: AniList's startDate matches TMDB's season N air_date.
+      - OR: Multiple AniList IDs share the same TMDB TV ID.
 
     Slicing:
       offset = episode_offset.tmdb or 0
@@ -23,19 +25,24 @@ PATTERN A — "single TMDB season, multiple AniList entries"
 PATTERN B — "single AniList entry, multiple TMDB seasons"
     AniList has one entry for the entire series. TMDB has many seasons.
     e.g. One Piece: AniList 21, TMDB 37854 (23 seasons, 1181 episodes).
+    e.g. Naruto: AniList 20, TMDB 46260 (4 seasons, 220 episodes total).
 
     Detection:
       - Fribb has only `themoviedb_id.tv`, no `season` field.
-      - AniList's `episodes` is null (ongoing) OR doesn't match any single
-        TMDB season's episode_count.
-      - TMDB `details.seasons[]` has >1 non-special season.
+      - AniList title does NOT contain "Season N" / "Part N" (otherwise
+        we'd be in Pattern A).
+      - AniList's `episodes` count == SUM of all TMDB seasons' episode_counts.
+      - OR: AniList's `episodes` is null AND series is RELEASING.
 
     Slicing:
       → fetch ALL non-special TMDB seasons in parallel.
-      → concatenate episodes with continuous numbering (TMDB-style).
-      → if AniList.episodes is null AND status == RELEASING: filter out
-         episodes whose air_date > today (upcoming episodes).
-      → if AniList.episodes is non-null: slice to that count.
+      → RENUMBER continuously 1..N (sort by season_number then episode_number).
+         We don't trust TMDB's own episode_number across seasons because some
+         shows reset per season (Hell Mode) and others continue (One Piece).
+      → if AniList.episodes is non-null: cap at that count.
+      → if AniList.nextAiringEpisode is set: cap at nextAiring - 1 (only
+         aired episodes).
+      → else (no count, no nextAiring): cap at "aired today" via air_date filter.
 
 PATTERN C — "simple: 1 AniList entry, 1 TMDB season"
     e.g. Cowboy Bebop: AniList 1, TMDB 30991 (1 season, 26 episodes).
@@ -59,10 +66,52 @@ inspect the data already fetched and decide what to slice/return.
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Optional
 
 from sources import fribb
+
+
+# Patterns to detect season number from AniList title (english or romaji)
+# Order matters: longer patterns first.
+_SEASON_TITLE_PATTERNS = [
+    # "Season 2", "season 3"
+    (re.compile(r'\bSeason\s+(\d+)\b', re.IGNORECASE), 'season'),
+    # "2nd Season", "3rd Season", "1st Season"
+    (re.compile(r'(\d+)(?:st|nd|rd|th)\s+Season', re.IGNORECASE), 'season'),
+    # "Part 2", "Part II"
+    (re.compile(r'\bPart\s+(\d+)\b', re.IGNORECASE), 'part'),
+    # "Cour 2", "Cour II"
+    (re.compile(r'\bCour\s+(\d+)\b', re.IGNORECASE), 'cour'),
+    # "II", "III" (Roman numerals at end of title)
+    # Only match if it's at the end AND not part of a word
+    (re.compile(r'\s(II|III|IV|V|VI|VII|VIII|IX|X)\s*$', re.IGNORECASE), 'roman'),
+]
+
+
+def detect_season_from_title(title: Optional[str]) -> Optional[int]:
+    """Parse an AniList title for season number.
+    Returns int (1-indexed) or None if no season indicator found.
+    """
+    if not title:
+        return None
+    for pat, kind in _SEASON_TITLE_PATTERNS:
+        m = pat.search(title)
+        if m:
+            val = m.group(1)
+            if kind == 'roman':
+                roman_map = {'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5,
+                             'VI': 6, 'VII': 7, 'VIII': 8, 'IX': 9, 'X': 10}
+                return roman_map.get(val.upper())
+            else:
+                try:
+                    n = int(val)
+                    if 1 <= n <= 50:  # sanity check
+                        return n
+                except (TypeError, ValueError):
+                    pass
+    return None
 
 
 # ─── Public API ─────────────────────────────────────────────────────
@@ -124,11 +173,47 @@ def detect_pattern(
     if len(tmdb_seasons) <= 1:
         return "pattern_c"
 
-    # >1 TMDB season. Pattern B if AniList considers this a single entry that
-    # spans all seasons (no offset, no Fribb season info). Pattern A only if
-    # AniList explicitly split this into multiple entries that map to the same TMDB ID
-    # AND Fribb gave us an offset — which we already returned above.
-    # So this branch is Pattern B.
+    # >1 TMDB season. Detect Pattern A via title (e.g. "Foo Season 2",
+    # "Foo 2nd Season", "Foo Part 2", "Foo Cour 2") — these are split-cour
+    # entries that map to ONE specific TMDB season.
+    title_en = (anilist_data.get("title") or {}).get("english") or ""
+    title_romaji = (anilist_data.get("title") or {}).get("romaji") or ""
+    title_season = detect_season_from_title(title_en) or detect_season_from_title(title_romaji)
+    if title_season is not None and title_season <= len(tmdb_seasons):
+        return "pattern_a"
+
+    # Pattern A via date matching: AniList's startDate matches a TMDB season's
+    # air_date AND AniList count < total TMDB count (split-cour hint).
+    anilist_eps = _safe_int(anilist_data.get("episodes"))
+    total_tmdb_eps = sum(s.get("episode_count", 0) or 0 for s in tmdb_seasons)
+    anilist_start = anilist_data.get("startDate") or {}
+    if (anilist_eps is not None and anilist_eps < total_tmdb_eps
+            and anilist_start.get("year") and anilist_start.get("month") and anilist_start.get("day")):
+        anilist_date_str = f"{anilist_start['year']:04d}-{anilist_start['month']:02d}-{anilist_start['day']:02d}"
+        for s in tmdb_seasons:
+            air = s.get("air_date") or ""
+            if air == anilist_date_str:
+                return "pattern_a"
+
+    # AniList count == sum of all TMDB seasons → Pattern B (e.g. Naruto)
+    if anilist_eps is not None and anilist_eps == total_tmdb_eps:
+        return "pattern_b"
+
+    # AniList count > total TMDB eps → Pattern B (TMDB incomplete)
+    if anilist_eps is not None and anilist_eps > total_tmdb_eps:
+        return "pattern_b"
+
+    # AniList count is null (ongoing like One Piece) → Pattern B
+    if anilist_eps is None:
+        return "pattern_b"
+
+    # AniList count < total TMDB eps but no title/date match — could be
+    # a hidden split-cour. Try matching count to a single TMDB season.
+    for s in tmdb_seasons:
+        if s.get("episode_count") == anilist_eps:
+            return "pattern_a"
+
+    # Default: Pattern B
     return "pattern_b"
 
 
@@ -179,6 +264,10 @@ def resolve_target_season(
 
     anilist_eps = _safe_int(anilist_data.get("episodes"))
     anilist_year = _safe_int(((anilist_data.get("startDate") or {}).get("year")))
+    anilist_start = anilist_data.get("startDate") or {}
+
+    # Calculate total TMDB episodes (sum of all non-special seasons)
+    total_tmdb_eps = sum(s.get("episode_count", 0) or 0 for s in tmdb_seasons)
 
     # If TMDB has only 1 non-special season, we're in Pattern C — easy.
     if len(tmdb_seasons) == 1:
@@ -186,38 +275,55 @@ def resolve_target_season(
         count = anilist_eps  # use AniList as the truth
         return _result([s["season_number"]], 0, count, "pattern_c", False)
 
-    # >1 TMDB season — try to match AniList entry to ONE TMDB season
-    # Match by year first (most reliable for split-cour anime), then by episode count.
-    # Special case: if AniList has no episode count (ongoing series like One Piece),
-    # we want ALL TMDB seasons (Pattern B), not just S1.
+    # >1 TMDB season. Check Pattern B FIRST (AniList count == sum of all TMDB
+    # seasons' episode_counts). This catches Naruto (AniList=220, TMDB total=220)
+    # before any title/date detection can falsely route to Pattern A.
+    if anilist_eps is not None and anilist_eps == total_tmdb_eps:
+        season_numbers = [s["season_number"] for s in tmdb_seasons]
+        return _result(season_numbers, 0, anilist_eps, "pattern_b", True)
+
+    # AniList count > total TMDB eps — TMDB might be incomplete; fetch all.
+    if anilist_eps is not None and anilist_eps > total_tmdb_eps:
+        season_numbers = [s["season_number"] for s in tmdb_seasons]
+        return _result(season_numbers, 0, None, "pattern_b", True)
+
+    # AniList has no episode count — likely ongoing. Pattern B with all seasons.
     if anilist_eps is None:
-        # Ongoing series — fetch all seasons, continuous numbering
         season_numbers = [s["season_number"] for s in tmdb_seasons]
         return _result(season_numbers, 0, None, "pattern_b", True)
 
-    # AniList gave us an episode count — check if it equals the SUM of all TMDB
-    # seasons' episode_counts. If yes, this is Pattern B (e.g. Naruto: AniList=220,
-    # TMDB has 4 seasons summing to 220). Don't try to match a single season.
-    total_tmdb_eps = sum(s.get("episode_count", 0) or 0 for s in tmdb_seasons)
-    if anilist_eps == total_tmdb_eps:
-        season_numbers = [s["season_number"] for s in tmdb_seasons]
-        return _result(season_numbers, 0, anilist_eps, "pattern_b", True)
+    # ── Title-based season detection (Pattern A inferred from title) ──
+    # AniList titles like "Foo Season 2", "Foo 2nd Season", "Foo Part 2",
+    # "Foo Cour 2" → we know this is a split-cour entry. Match the season
+    # number from the title to a TMDB season.
+    title_en = (anilist_data.get("title") or {}).get("english") or ""
+    title_romaji = (anilist_data.get("title") or {}).get("romaji") or ""
+    title_season = detect_season_from_title(title_en) or detect_season_from_title(title_romaji)
 
-    # AniList count is between 1 and total_tmdb_eps — maybe AniList is a subset
-    # (e.g. Doraemon 2005: AniList says next=929, but TMDB has 1464 "aired" eps).
-    # In this case, we fetch all seasons and cap at anilist_eps.
-    if anilist_eps > 0 and anilist_eps < total_tmdb_eps:
-        season_numbers = [s["season_number"] for s in tmdb_seasons]
-        return _result(season_numbers, 0, anilist_eps, "pattern_b", True)
+    if title_season is not None and title_season <= len(tmdb_seasons):
+        # Found "Season N" in title and TMDB has season N. Use it.
+        # This catches Hell Mode S2, Demon Slayer S2, Attack on Titan S2, etc.
+        target = tmdb_seasons[title_season - 1]  # title_season is 1-indexed
+        count = anilist_eps  # use AniList's count
+        return _result([target["season_number"]], 0, count, "pattern_a_title", False)
 
-    # AniList count > total TMDB eps — TMDB might be incomplete; fetch all and
-    # return what we have (cap at anilist_eps to allow growth).
-    if anilist_eps > total_tmdb_eps:
-        season_numbers = [s["season_number"] for s in tmdb_seasons]
-        return _result(season_numbers, 0, None, "pattern_b", True)
+    # ── Date-based season detection (Pattern A inferred from air date) ──
+    # If AniList's startDate matches a specific TMDB season's air_date exactly,
+    # we know this entry belongs to that season (even without title info).
+    # Only used when AniList count < total TMDB count (split-cour hint).
+    if anilist_eps is not None and anilist_eps < total_tmdb_eps:
+        if anilist_start.get("year") and anilist_start.get("month") and anilist_start.get("day"):
+            anilist_date_str = f"{anilist_start['year']:04d}-{anilist_start['month']:02d}-{anilist_start['day']:02d}"
+            for s in tmdb_seasons:
+                air = s.get("air_date") or ""
+                if air == anilist_date_str:
+                    count = anilist_eps
+                    return _result([s["season_number"]], 0, count, "pattern_a_date", False)
 
-    # Try matching to a single TMDB season (Pattern A inferred — split-cour where
-    # Fribb didn't have offset info)
+    # AniList count < total TMDB eps but no title or date match.
+    # Try matching AniList's count to a single TMDB season's episode_count
+    # (Pattern A inferred — split-cour where Fribb didn't have offset info
+    # and the title didn't contain "Season N").
     best_season = _match_anilist_to_tmdb_season(
         tmdb_seasons, anilist_eps=anilist_eps, anilist_year=anilist_year,
     )
@@ -265,9 +371,19 @@ def slice_episodes(
     if not tmdb_episodes:
         return []
 
-    # Sort by original number ascending (TMDB seasons come in order)
+    # Sort episodes. For Pattern B (continuous_numbering=True), we sort by
+    # (season_number, episode_number) to keep S1 episodes before S2 episodes
+    # even when TMDB's season numbers reset (e.g. Hell Mode S1=1..12, S2=1..12
+    # — without season-aware sort, eps 1,1,2,2,... would be interleaved).
+    # For Pattern A/C, sort by episode_number alone is fine (single season).
     try:
-        eps_sorted = sorted(tmdb_episodes, key=lambda e: e.get("number", 0))
+        if continuous_numbering:
+            eps_sorted = sorted(tmdb_episodes, key=lambda e: (
+                e.get("season", 0) or 0,
+                e.get("number", 0) or 0,
+            ))
+        else:
+            eps_sorted = sorted(tmdb_episodes, key=lambda e: e.get("number", 0))
     except Exception:
         eps_sorted = list(tmdb_episodes)
 
@@ -293,11 +409,13 @@ def slice_episodes(
         if not include_upcoming and air_date and air_date > today:
             continue
 
-        # Renumber
-        if continuous_numbering:
-            new_number = ep.get("number", new_idx)
-        else:
-            new_number = new_idx
+        # Renumber:
+        # - For continuous_numbering (Pattern B): always renumber 1..N based on
+        #   position. We DON'T trust TMDB's number because some shows reset
+        #   per season (Hell Mode S1=1..12, S2=1..12). Sorting by (season, ep)
+        #   above puts them in the right order, then we just number sequentially.
+        # - For per-entry renumbering (Pattern A): use new_idx (1..count).
+        new_number = new_idx
 
         # ── Cap by AniList's nextAiringEpisode ──
         # AniList says "next episode to air is N" → that means episodes 1..N-1
