@@ -224,7 +224,10 @@ def slice_episodes(
     Args:
         tmdb_episodes: episodes returned by tmdb.extract_episodes() (or
             concatenated from multiple seasons for Pattern B).
-        offset: 0-indexed start offset (Fribb's episode_offset.tmdb).
+        offset: Fribb's episode_offset.tmdb. This is a 1-INDEXED TMDB
+            episode_number indicating where this AniList entry starts
+            (e.g. offset=26 means "starts at TMDB episode 26"). A value of
+            0 or None means "starts at the beginning" (no offset).
         count: max number of episodes to keep. None = keep all (filter by air date only).
         continuous_numbering: True = keep TMDB's continuous numbering (1..N for
             the whole series, e.g. One Piece). False = renumber 1..count for
@@ -241,8 +244,14 @@ def slice_episodes(
     except Exception:
         eps_sorted = list(tmdb_episodes)
 
-    # Slice by offset + count
-    start = max(0, offset)
+    # Fribb's episode_offset.tmdb is 1-INDEXED — it's the TMDB episode_number
+    # where this AniList entry starts. So if offset=26, we want TMDB episode 26
+    # to be our first episode. In a 0-indexed Python list, episode N lives at
+    # index N-1. So we convert: start_index = max(0, offset - 1).
+    if offset and offset > 0:
+        start = max(0, offset - 1)
+    else:
+        start = 0
     if count is not None and count > 0:
         end = start + count
     else:
