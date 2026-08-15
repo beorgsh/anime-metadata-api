@@ -75,15 +75,61 @@ async def _fetch_all_impl(anilist_id: int) -> dict:
     if tmdb_type and tmdb_id:
         async with httpx.AsyncClient(timeout=15.0) as client:
             if tmdb_type == "tv":
-                # Fetch TV season 1 + images in parallel
-                season_task = asyncio.create_task(tmdb.fetch_tv_season(tmdb_id, 1, client))
-                images_task = asyncio.create_task(tmdb.fetch_tv_images(tmdb_id, client))
+                # Determine which season(s) to fetch
+                # Fribb's season.tmdb field tells us which TMDB season this AniList entry maps to.
+                # If present (e.g. Solo Leveling S2 → season 2), fetch ONLY that season.
+                # If absent (e.g. Naruto, One Piece — entire series under one AniList ID),
+                # fetch ALL seasons and combine episodes with proper numbering offsets.
+                fribb_season = None
+                if fribb_data:
+                    season_info = fribb_data.get("season") or {}
+                    fribb_season = season_info.get("tmdb")
+
+                # Fetch TV details + images in parallel with season data
                 details_task = asyncio.create_task(tmdb.fetch_tv(tmdb_id, client))
-                season_data, images_data, details = await asyncio.gather(
-                    season_task, images_task, details_task, return_exceptions=True
-                )
-                if isinstance(season_data, dict) and not isinstance(season_data, Exception):
-                    tmdb_episodes = tmdb.extract_episodes(season_data, anilist_id)
+                images_task = asyncio.create_task(tmdb.fetch_tv_images(tmdb_id, client))
+
+                if fribb_season is not None:
+                    # Specific season — fetch just that one
+                    season_task = asyncio.create_task(tmdb.fetch_tv_season(tmdb_id, fribb_season, client))
+                    season_data, images_data, details = await asyncio.gather(
+                        season_task, images_task, details_task, return_exceptions=True
+                    )
+                    if isinstance(season_data, dict) and not isinstance(season_data, Exception):
+                        tmdb_episodes = tmdb.extract_episodes(season_data, anilist_id)
+                else:
+                    # No season specified — fetch ALL seasons (for long anime like Naruto, One Piece)
+                    # First get the TV details to know how many seasons exist
+                    details = await details_task
+                    if isinstance(details, dict) and details:
+                        all_seasons = [s["season_number"] for s in details.get("seasons", [])
+                                       if s.get("season_number", 0) > 0]  # skip specials (S0)
+                        if all_seasons:
+                            # Fetch all seasons in parallel
+                            season_tasks = [
+                                asyncio.create_task(tmdb.fetch_tv_season(tmdb_id, s, client))
+                                for s in all_seasons
+                            ]
+                            season_results = await asyncio.gather(*season_tasks, return_exceptions=True)
+
+                            # Combine episodes from all seasons with continuous numbering
+                            # TMDB resets episode numbers per season, but AniList uses continuous numbering
+                            # So we offset: S2E1 becomes EP(52+1)=53, S3E1 becomes EP(104+1)=105, etc.
+                            episode_offset = 0
+                            for i, sd in enumerate(season_results):
+                                if isinstance(sd, dict) and not isinstance(sd, Exception):
+                                    season_eps = tmdb.extract_episodes(sd, anilist_id)
+                                    # Apply offset to episode numbers
+                                    for ep in season_eps:
+                                        ep["number"] = ep["number"] + episode_offset
+                                        ep["season"] = all_seasons[i]
+                                        ep["season_episode"] = ep["number"] - episode_offset
+                                    tmdb_episodes.extend(season_eps)
+                                    episode_offset += len(season_eps)
+
+                    # Now get images (already started)
+                    images_data = await images_task
+
                 if isinstance(images_data, dict) and not isinstance(images_data, Exception):
                     tmdb_images = tmdb.extract_images(images_data, "tv")
                 if isinstance(details, dict) and not isinstance(details, Exception):
