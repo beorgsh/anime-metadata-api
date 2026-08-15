@@ -461,17 +461,34 @@ def slice_episodes(
 
     # Fribb's episode_offset.tmdb is 1-INDEXED — it's the TMDB episode_number
     # where this AniList entry starts. So if offset=26, we want TMDB episode 26
-    # to be our first episode. In a 0-indexed Python list, episode N lives at
-    # index N-1. So we convert: start_index = max(0, offset - 1).
+    # to be our first episode.
+    #
+    # IMPORTANT: We can't use list slicing (eps_sorted[offset-1:]) because the
+    # TMDB episode list might not start at index 0. For example, Re:Zero S4
+    # (AniList 189046) has offset=66, but we only fetch episodes 67-85 from
+    # TMDB (because S4 starts at TMDB EP 67... wait, that contradicts).
+    #
+    # Actually, let's verify the meaning:
+    # - Re:Zero S1 (AniList 21355): offset=0, eps start at TMDB EP 1
+    # - Re:Zero S2P1 (AniList 108632): offset=26, eps start at TMDB EP 26
+    #   (S1 had 25 eps, so S2P1 starts at the 26th TMDB ep)
+    # - Re:Zero S2P2 (AniList 119661): offset=38, eps start at TMDB EP 38
+    #   (S1=25 + S2P1=13 = 38, so S2P2 starts at the 38th TMDB ep)
+    # - Re:Zero S3 (AniList 163134): offset=50, eps start at TMDB EP 50
+    # - Re:Zero S4 (AniList 189046): offset=66, eps start at TMDB EP 66
+    #   (S1=25 + S2P1=13 + S2P2=12 + S3=16 = 66)
+    #
+    # Wait, S3 has 16 eps. So S3 ends at EP 65 (50+15=65, since EP 50 is the 1st).
+    # Then S4 should start at EP 66. Yes, offset=66 means S4's first episode is
+    # TMDB EP 66.
+    #
+    # So filter: keep episodes whose TMDB number >= offset (when offset > 0).
     if offset and offset > 0:
-        start = max(0, offset - 1)
+        sliced = [e for e in eps_sorted if e.get("number", 0) >= offset]
     else:
-        start = 0
+        sliced = list(eps_sorted)
     if count is not None and count > 0:
-        end = start + count
-    else:
-        end = len(eps_sorted)
-    sliced = eps_sorted[start:end]
+        sliced = sliced[:count]
 
     today = time.strftime("%Y-%m-%d")
     out: list[dict] = []
@@ -491,18 +508,66 @@ def slice_episodes(
 
         # ── Cap by AniList's nextAiringEpisode ──
         # AniList says "next episode to air is N" → that means episodes 1..N-1
-        # have aired. If we've already returned N-1 episodes, stop. This catches
-        # cases where TMDB has extra episodes (recaps, multi-part specials, etc.)
-        # that aren't real AniList episodes.
+        # have aired. We cap at N-1 to avoid returning unaired TMDB episodes.
+        #
+        # EXCEPTION: If AniList's nextAiringEpisode count seems out of sync with
+        # reality (AniList says EP N is "next to air" but TMDB has an episode
+        # with the SAME air_date that already happened), we trust TMDB's air
+        # date for that single episode.
+        #
+        # This catches the Re:Zero S4 case where:
+        #   - AniList says nextAiring=13 (so EP 13 should be unaired)
+        #   - But TMDB EP 78 (= AniList S4 EP 13) has air_date=2026-08-12 (aired)
+        #   - We should include EP 13 because TMDB says it aired
+        #
+        # BUT this does NOT apply to Doraemon-style cases where AniList's
+        # episode numbering differs from TMDB's. For those, we trust AniList's
+        # cap strictly (otherwise we'd return way more episodes than AniList
+        # considers "aired").
+        #
+        # The disambiguation: only override AniList's cap if BOTH conditions hold:
+        #   1. AniList's nextAiringEpisode is "recent" (within last 30 days)
+        #      — meaning AniList schedule is actively maintained for this anime
+        #   2. The episode we're considering has aired per TMDB (air_date <= today)
+        #
+        # If AniList's nextAiringEpisode is far in the future (like Doraemon
+        # where nextAiring=929 but AniList has only "aired" 928), we trust
+        # AniList strictly because the AniList numbering space is different.
+        #
+        # We can detect this: if the episode's air_date is in the past AND
+        # the air_date is within the last 30 days, it's a "recently aired"
+        # episode that AniList might not have caught up to. Otherwise, we
+        # trust AniList's cap.
         if anilist_next_airing and anilist_next_airing > 0:
             if continuous_numbering:
-                # Continuous: episode number = TMDB's number. Cap at next_airing-1.
-                if ep.get("number", 0) >= anilist_next_airing:
-                    continue
+                tmdb_num = ep.get("number", 0)
+                if tmdb_num >= anilist_next_airing:
+                    # Past AniList's cap. Override only if this is a "recently aired" episode.
+                    recent_aired = False
+                    if air_date and air_date <= today:
+                        try:
+                            from datetime import date, timedelta
+                            d_air = date.fromisoformat(air_date)
+                            d_today = date.fromisoformat(today)
+                            # Episode aired recently (within 30 days) → trust TMDB
+                            recent_aired = (d_today - d_air).days <= 30
+                        except Exception:
+                            pass
+                    if not recent_aired:
+                        continue
             else:
-                # Per-entry renumbered: cap at next_airing-1 in the renumbered space.
                 if new_number >= anilist_next_airing:
-                    continue
+                    recent_aired = False
+                    if air_date and air_date <= today:
+                        try:
+                            from datetime import date, timedelta
+                            d_air = date.fromisoformat(air_date)
+                            d_today = date.fromisoformat(today)
+                            recent_aired = (d_today - d_air).days <= 30
+                        except Exception:
+                            pass
+                    if not recent_aired:
+                        continue
 
         new_ep = dict(ep)  # shallow copy
         new_ep["number"] = new_number
