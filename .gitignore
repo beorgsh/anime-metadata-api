@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+.env
+data/anilist_index.json
+data/anime-list-mini.json
+*.log
