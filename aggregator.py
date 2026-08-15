@@ -159,24 +159,16 @@ async def _fetch_all_impl(
             season_results = await asyncio.gather(*season_tasks, return_exceptions=True)
 
             # Extract + concatenate episodes from each season
+            # IMPORTANT: TMDB already uses continuous numbering for shows like
+            # One Piece (S1=1-61, S2=62-77, S21=892-1088, ...). So for Pattern B
+            # we just concatenate in season order and KEEP TMDB's numbers as-is.
+            # No artificial offset is needed.
             for sn, sd in zip(target_seasons, season_results):
                 if isinstance(sd, dict) and not isinstance(sd, Exception):
                     season_eps = tmdb.extract_episodes(sd, anilist_id)
-                    # For Pattern B (multi-season continuous), apply season offset
-                    if continuous_numbering and len(target_seasons) > 1:
-                        # Calculate the running offset based on TMDB season's
-                        # position in the seasons[] array (each prior season
-                        # contributes its episode_count to the offset).
-                        seasons_meta = [s for s in (tmdb_details.get("seasons") or [])
-                                       if s.get("season_number", 0) > 0]
-                        running_offset = 0
-                        for sm in seasons_meta:
-                            if sm.get("season_number") == sn:
-                                break
-                            running_offset += sm.get("episode_count", 0) or 0
-                        for ep in season_eps:
-                            ep["number"] = ep["number"] + running_offset
-                            ep["season"] = sn
+                    # Tag each episode with its season number
+                    for ep in season_eps:
+                        ep["season"] = sn
                     tmdb_episodes.extend(season_eps)
 
             images_data = await images_task
