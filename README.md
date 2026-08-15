@@ -225,7 +225,7 @@ Cache key includes the `season` + `include_upcoming` + `extras` flags so differe
 |-----|---------|-------------|
 | `PORT` | `8000` | HTTP port |
 | `PYTHONUNBUFFERED` | `1` | Python stdout buffering |
-| `TMDB_API_KEY` | bundled demo key | Override with your own TMDB API key (recommended for production) |
+| `TMDB_API_KEY` | **(required)** | TMDB API key — get one from https://www.themoviedb.org/settings/api |
 
 ## Test cases (verified working)
 

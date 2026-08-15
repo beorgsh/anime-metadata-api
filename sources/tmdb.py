@@ -1,9 +1,9 @@
 """
 sources/tmdb.py — TMDB API client.
 
-Uses TMDB's official documentation API key (8265bd1679663a7ea12ac168da84d2e8)
-which is published in their getting-started guide and meant to be public.
-Verified: 3000+ req/min sustained, zero 429 rate limits.
+Requires the TMDB_API_KEY environment variable to be set. The API key is
+not hardcoded in the source — get one from https://www.themoviedb.org/settings/api
+and add it to your environment (e.g. Render env vars, .env file, etc.).
 
 Endpoints used:
 - /tv/{id}              — TV series details
@@ -26,19 +26,25 @@ import httpx
 
 log = logging.getLogger("tmdb")
 
-# Official TMDB documentation key — published in their getting-started guide.
-# https://developer.themoviedb.org/reference/intro/getting-started
-# Override with TMDB_API_KEY env var if you have your own.
-DEFAULT_TMDB_KEY = "8265bd1679663a7ea12ac168da84d2e8"
-TMDB_KEY = DEFAULT_TMDB_KEY
+# TMDB API key is loaded from the TMDB_API_KEY environment variable.
+# Do NOT hardcode it in source. Get one from:
+# https://www.themoviedb.org/settings/api
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
 TIMEOUT = 15.0
 
 
 def _get_key() -> str:
+    """Return the TMDB API key from the environment."""
     import os
-    return os.environ.get("TMDB_API_KEY", DEFAULT_TMDB_KEY)
+    key = os.environ.get("TMDB_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "TMDB_API_KEY environment variable is not set. "
+            "Get an API key from https://www.themoviedb.org/settings/api "
+            "and set it in your environment."
+        )
+    return key
 
 
 def _img(path: Optional[str], size: str = "original") -> Optional[str]:
