@@ -5,13 +5,21 @@ Endpoint: GET /api/episodes/{anilist_id}
 Returns: episode titles, thumbnails, banners, clearlogos, posters, mappings
          for any anime by AniList ID.
 
-Sources (multi-source, fetched in parallel):
-  1. Fribb/anime-lists — AniList↔TMDB static mapping (in-memory, O(1))
-  2. AniList GraphQL — title, year, format, episode count, cover image
+Sources (multi-source, fetched in parallel, then cross-verified):
+  1. AniList GraphQL — PRIMARY source for title, format, year, episode count,
+       season, status. (This is the "graph URL" used as the verification anchor.)
+  2. AniBridge — live cross-provider mapping API (AniList↔AniDB↔MAL↔Kitsu↔
+       TMDB↔TVDB↔IMDB). Replaces Fribb as the primary mapping source.
   3. AniZip (api.ani.zip) — TVDB images + episode data
   4. TMDB — episodes with stills, logos, backdrops, posters (TV + Movies)
+  5. Jikan (MyAnimeList) — episode count + season + status verifier
+  6. Kitsu — episode count + season + status verifier
+  7. Fribb/anime-lists — secondary fallback AniList↔TMDB static mapping
 
-100% keyless (uses TMDB's official documentation key).
+The API's "own brain" (verifier.py) cross-checks episode count, season, and
+status across all sources and reports the verdict + confidence + discrepancies.
+
+100% keyless (uses TMDB's official documentation key + public APIs).
 7-day in-memory cache. No database. Handles TV, movies, OVAs, new anime.
 """
 from __future__ import annotations
@@ -30,7 +38,7 @@ from dotenv import load_dotenv
 
 from aggregator import fetch_all
 from cache import metadata_cache, tmdb_id_cache
-from sources import fribb, anilist as anilist_source
+from sources import fribb, anilist as anilist_source, anibridge, jikan, kitsu
 
 load_dotenv()
 
@@ -63,8 +71,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Anime Metadata API",
-    version="1.0.0",
-    description="Bulletproof anime metadata API — AniList ID in, episode titles/thumbnails/banners/clearlogos out.",
+    version="2.0.0",
+    description="Multi-source anime metadata API with cross-source verification. AniList ID in, verified episode titles/thumbnails/banners/clearlogos/mappings out.",
     lifespan=lifespan,
 )
 
@@ -85,9 +93,18 @@ async def get_episodes(anilist_id: int):
     Returns episode names, thumbnails, banners, clearlogos, posters, and
     cross-references for any anime by AniList ID.
 
-    Sources data from Fribb (AniList↔TMDB mapping), AniList GraphQL,
-    AniZip (TVDB images), and TMDB (episode stills, logos, backdrops).
+    Sources (in parallel, then cross-verified):
+      - AniList GraphQL (primary metadata)
+      - AniBridge (cross-provider mapping + verified `units`)
+      - AniZip (TVDB images + episodes)
+      - TMDB (episode stills + images)
+      - Jikan/MAL (episode count + season verifier)
+      - Kitsu (episode count + season verifier)
+      - Fribb (secondary mapping fallback)
+
     All fetched in parallel. Cached for 7 days.
+    The response includes a `verification` block showing the confidence +
+    discrepancies of each cross-checked field.
     """
     if anilist_id <= 0:
         raise HTTPException(status_code=400, detail="anilist_id must be a positive integer")
@@ -162,6 +179,17 @@ async def health():
     """Health check + stats."""
     return {
         "status": "ok",
+        "sources": {
+            "fribb": fribb.stats(),
+            "anibridge": anibridge.stats(),
+            "jikan": jikan.stats(),
+            "kitsu": kitsu.stats(),
+        },
+        "caches": {
+            "metadata_cache": metadata_cache.stats(),
+            "tmdb_id_cache": tmdb_id_cache.stats(),
+        },
+        # Backwards-compat
         "fribb": fribb.stats(),
         "metadata_cache": metadata_cache.stats(),
         "tmdb_id_cache": tmdb_id_cache.stats(),
@@ -244,12 +272,13 @@ footer a{color:var(--blue);text-decoration:none}
 <div class="container">
   <header>
     <h1>Anime Metadata API</h1>
-    <p>Enter an AniList ID to get episode titles, thumbnails, banners, clearlogos, and cross-references. Multi-source: Fribb + AniList + AniZip + TMDB.</p>
+    <p>Enter an AniList ID to get episode titles, thumbnails, banners, clearlogos, and cross-references. Multi-source + cross-verified: AniList GraphQL (primary) + AniBridge + Jikan/MAL + Kitsu + AniZip + TMDB + Fribb.</p>
     <div class="badges">
       <span class="badge live">Live</span>
       <span class="badge">100% keyless</span>
       <span class="badge">TV + Movies</span>
       <span class="badge">7-day cache</span>
+      <span class="badge">Cross-source verified</span>
     </div>
   </header>
 
@@ -267,6 +296,8 @@ footer a{color:var(--blue);text-decoration:none}
     <button onclick="quickTest(199)">Spirited Away (Movie)</button>
     <button onclick="quickTest(164)">Princess Mononoke (Movie)</button>
     <button onclick="quickTest(101922)">Demon Slayer</button>
+    <button onclick="quickTest(1)">Cowboy Bebop</button>
+    <button onclick="quickTest(5114)">Fullmetal Alchemist: Brotherhood</button>
   </div>
 
   <div id="status" class="status" style="display:none"></div>
@@ -292,7 +323,7 @@ async function fetchData() {
       showStatus('error', d.detail || `HTTP ${r.status}`);
       return;
     }
-    showStatus('success', `✅ Loaded in ${d.meta.cacheStats ? '(cached)' : ''} — resolver: ${d.meta.resolver || 'n/a'}`);
+    showStatus('success', `✅ Loaded — resolver: ${d.meta.resolver || 'n/a'} · ${d.data.verification ? d.data.verification.summary.episode_count_agreed ? 'episodes verified ✓' : 'episode count discrepancy ⚠' : ''}`);
     renderResult(d.data);
   } catch(e) {
     showStatus('error', 'Network error: ' + e.message);
@@ -352,12 +383,38 @@ function renderResult(data) {
   // Sources
   html += '<div class="meta" style="margin-top:8px;font-size:.72rem">';
   const s = data.sources || {};
-  html += `<span>Resolver: ${s.resolver_method || '?'}</span>`;
+  html += `<span>Resolver: ${s.resolver_method || '?'} ${s.resolver_tried ? '(' + s.resolver_tried.join('→') + ')' : ''}</span>`;
   if (s.anilist) html += `<span style="color:var(--green)">AniList ✓</span>`;
-  if (s.fribb) html += `<span style="color:var(--green)">Fribb ✓</span>`;
+  if (s.anibridge) html += `<span style="color:var(--green)">AniBridge ✓</span>`;
+  if (s.jikan) html += `<span style="color:var(--green)">Jikan/MAL ✓</span>`;
+  if (s.kitsu) html += `<span style="color:var(--green)">Kitsu ✓</span>`;
   if (s.anizip) html += `<span style="color:var(--green)">AniZip ✓</span>`;
+  if (s.fribb) html += `<span style="color:var(--green)">Fribb ✓</span>`;
   if (s.tmdb) html += `<span style="color:var(--green)">TMDB ✓</span>`;
   html += '</div>';
+
+  // Verification block
+  if (data.verification) {
+    const v = data.verification;
+    const summary = v.summary || {};
+    const confColor = (ok) => ok ? 'var(--green)' : 'var(--amber)';
+    html += `<div style="margin-top:10px;padding:10px;background:rgba(0,0,0,.25);border-radius:8px;font-size:.74rem">`;
+    html += `<div style="color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Cross-source verification</div>`;
+    const ev = v.episodes || {};
+    html += `<div style="display:flex;gap:10px;flex-wrap:wrap">`;
+    html += `<span style="color:${confColor(summary.episode_count_agreed)}">Episodes: ${ev.value ?? '?'} (${ev.confidence ?? '?'}) — ${(ev.sources||[]).join('+')||'no data'}</span>`;
+    const sv = v.season || {};
+    html += `<span style="color:${confColor(summary.season_agreed)}">Season: ${sv.season ?? '?'} ${sv.year ?? ''} (${sv.confidence ?? '?'})</span>`;
+    const stv = v.status || {};
+    html += `<span style="color:${confColor(summary.status_agreed)}">Status: ${stv.value ?? '?'} (${stv.confidence ?? '?'})</span>`;
+    html += `</div>`;
+    // Discrepancies detail
+    if (ev.discrepancies && ev.discrepancies.length) {
+      html += `<div style="margin-top:6px;color:var(--amber)">Episode count discrepancies: ` +
+        ev.discrepancies.map(d => `${d.source}=${d.value}`).join(', ') + `</div>`;
+    }
+    html += `</div>`;
+  }
   html += '</div>';
 
   html += '<div class="result-body">';
