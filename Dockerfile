@@ -10,8 +10,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY api.py aggregator.py resolver.py verifier.py seasons.py cache.py ./
 COPY sources/ ./sources/
 
-# Copy AniBridge mappings data (downloaded at build time)
-COPY data/anibridge_mappings.json ./data/anibridge_mappings.json
+# Download AniBridge mappings during build (~14MB, cached in Docker layer)
+RUN python3 -c "import urllib.request; urllib.request.urlretrieve('https://github.com/anibridge/anibridge-mappings/releases/download/v3/mappings.json', '/app/data/anibridge_mappings.json')" || echo "AniBridge download failed — will try at runtime"
 
 # Data directory for Fribb JSON (downloaded at startup)
 RUN mkdir -p /app/data
