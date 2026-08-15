@@ -59,3 +59,5 @@ class TTLCache:
 # Global cache instances
 metadata_cache = TTLCache(default_ttl=7 * 24 * 3600)  # 7 days for metadata
 tmdb_id_cache = TTLCache(default_ttl=30 * 24 * 3600)   # 30 days for ID mappings (rarely change)
+relations_cache = TTLCache(default_ttl=30 * 24 * 3600)  # 30 days for AniList prequel/sequel chain
+offset_cache = TTLCache(default_ttl=30 * 24 * 3600)     # 30 days for calculated episode offsets

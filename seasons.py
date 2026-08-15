@@ -114,6 +114,50 @@ def detect_season_from_title(title: Optional[str]) -> Optional[int]:
     return None
 
 
+# Patterns we STRIP from titles when doing a TMDB search.
+# e.g. "HELL MODE Season 2" → "HELL MODE"
+# e.g. "Foo 2nd Season" → "Foo"
+# e.g. "Foo Part 2" → "Foo"
+# e.g. "Foo Cour 2" → "Foo"
+# e.g. "Foo II" → "Foo"
+# (Order matters: longer patterns first.)
+_SEASON_STRIP_PATTERNS = [
+    re.compile(r'\s*\bSeason\s+\d+\b\s*', re.IGNORECASE),
+    re.compile(r'\s*\b\d+(?:st|nd|rd|th)\s+Season\b\s*', re.IGNORECASE),
+    re.compile(r'\s*\bFinal\s+Season\b\s*', re.IGNORECASE),
+    re.compile(r'\s*\bPart\s+\d+\b\s*', re.IGNORECASE),
+    re.compile(r'\s*\bCour\s+\d+\b\s*', re.IGNORECASE),
+    # Roman numerals at the END of the title (with optional preceding space)
+    re.compile(r'\s+(?:II|III|IV|V|VI|VII|VIII|IX|X)\s*$', re.IGNORECASE),
+]
+
+
+def strip_season_tag(title: Optional[str]) -> Optional[str]:
+    """Remove season indicators from a title for TMDB search.
+
+    Examples:
+        "HELL MODE ... Season 2" → "HELL MODE ..."
+        "Foo 2nd Season" → "Foo"
+        "Foo Part 2" → "Foo"
+        "Foo Cour 2" → "Foo"
+        "Foo II" → "Foo"
+        "Plain Title" → "Plain Title" (unchanged)
+
+    Strips multiple patterns (e.g. "Re:Zero Season 2 Part 2" → "Re:Zero").
+    Trims trailing whitespace and punctuation.
+    """
+    if not title:
+        return None
+    cleaned = title
+    for pat in _SEASON_STRIP_PATTERNS:
+        cleaned = pat.sub(' ', cleaned)
+    # Collapse multiple spaces, trim
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    # Strip trailing punctuation that often remains (colon, dash)
+    cleaned = re.sub(r'[\s:\-]+$', '', cleaned).strip()
+    return cleaned or None
+
+
 # ─── Public API ─────────────────────────────────────────────────────
 
 
@@ -224,6 +268,7 @@ def resolve_target_season(
     fribb_data: Optional[dict],
     tmdb_details: dict,
     explicit_season: Optional[int] = None,
+    calculated_offset: Optional[int] = None,
 ) -> dict:
     """
     Decide which TMDB season(s) to fetch and how to slice the result.
@@ -254,7 +299,7 @@ def resolve_target_season(
         if tmdb_season is not None:
             anilist_eps = _safe_int(anilist_data.get("episodes"))
             count = anilist_eps if anilist_eps and anilist_eps > 0 else None
-            return _result([int(tmdb_season)], int(tmdb_offset), count, "pattern_a", False)
+            return _result([int(tmdb_season)], int(tmdb_offset), count, "pattern_a_fribb", False)
 
     # Pattern B / C detection — look at TMDB details
     tmdb_seasons = [s for s in (tmdb_details.get("seasons") or []) if s.get("season_number", 0) > 0]
@@ -269,10 +314,27 @@ def resolve_target_season(
     # Calculate total TMDB episodes (sum of all non-special seasons)
     total_tmdb_eps = sum(s.get("episode_count", 0) or 0 for s in tmdb_seasons)
 
-    # If TMDB has only 1 non-special season, we're in Pattern C — easy.
+    # If TMDB has only 1 non-special season, we're either in:
+    #   - Pattern A_chain (split-cour merged in TMDB): we have a calculated offset
+    #   - Pattern C (simple): no offset
     if len(tmdb_seasons) == 1:
         s = tmdb_seasons[0]
-        count = anilist_eps  # use AniList as the truth
+        # Decision A_chain — TMDB merged multiple AniList seasons into one giant
+        # S1 (e.g. Re:Zero: TMDB has 85 eps in S1, AniList splits into 25+13+12+16).
+        # The calculated_offset from the AniList prequel chain tells us where
+        # THIS AniList entry starts in the merged S1.
+        #
+        # SAFETY: Only apply the calculated offset if it makes sense — i.e.
+        # the offset is less than the TMDB season's total episode count.
+        # Otherwise we'd slice past the end and return 0 episodes.
+        # (e.g. Doraemon 2005: AniList prequel chain gives offset=1813 because
+        # it traces back to the 1979 Doraemon, but TMDB's 2005 series only
+        # has 1464 episodes — the offset is bogus for THIS TMDB entry.)
+        if (calculated_offset and calculated_offset > 0
+                and calculated_offset < s.get("episode_count", 0)):
+            count = anilist_eps
+            return _result([s["season_number"]], calculated_offset, count, "pattern_a_chain", False)
+        count = anilist_eps
         return _result([s["season_number"]], 0, count, "pattern_c", False)
 
     # >1 TMDB season. Check Pattern B FIRST (AniList count == sum of all TMDB
@@ -306,6 +368,16 @@ def resolve_target_season(
         target = tmdb_seasons[title_season - 1]  # title_season is 1-indexed
         count = anilist_eps  # use AniList's count
         return _result([target["season_number"]], 0, count, "pattern_a_title", False)
+
+    # ── Decision A_chain fallback — TMDB has >1 season but title doesn't match ──
+    # If we have a calculated offset from the prequel chain, use it to slice.
+    # SAFETY: Only apply if offset is reasonable (less than total TMDB eps).
+    first_season_ep_count = tmdb_seasons[0].get("episode_count", 0)
+    if (calculated_offset and calculated_offset > 0
+            and calculated_offset < first_season_ep_count):
+        season_numbers = [tmdb_seasons[0]["season_number"]]
+        count = anilist_eps
+        return _result(season_numbers, calculated_offset, count, "pattern_a_chain", False)
 
     # ── Date-based season detection (Pattern A inferred from air date) ──
     # If AniList's startDate matches a specific TMDB season's air_date exactly,

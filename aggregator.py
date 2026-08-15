@@ -32,7 +32,7 @@ from typing import Optional
 
 import httpx
 
-from cache import metadata_cache
+from cache import metadata_cache, offset_cache
 from sources import anilist, anizip, fribb, tmdb
 from resolver import resolve_tmdb_id
 from seasons import (
@@ -138,12 +138,35 @@ async def _fetch_all_impl(
                 pattern = "extras"
                 continuous_numbering = False
             else:
+                # ── Compute calculated offset from AniList prequel chain ──
+                # Used as a fallback when Fribb doesn't have an explicit offset.
+                # Skip this if Fribb already has season+offset (fast path).
+                calculated_offset = None
+                fribb_has_offset = (
+                    fribb_data and
+                    (fribb_data.get("episode_offset") or {}).get("tmdb")
+                )
+                if not fribb_has_offset:
+                    # Check cache first
+                    offset_cache_key = f"chain_offset:{anilist_id}"
+                    cached_offset = offset_cache.get(offset_cache_key)
+                    if cached_offset is not None:
+                        calculated_offset = cached_offset.get("offset")
+                    else:
+                        try:
+                            offset_result = await anilist.calculate_chain_offset(anilist_id, client)
+                            calculated_offset = offset_result.get("offset") or 0
+                            offset_cache.set(offset_cache_key, offset_result)
+                        except Exception as e:
+                            log.warning("Chain offset calc for %d failed: %s", anilist_id, e)
+
                 decision = resolve_target_season(
                     anilist_id=anilist_id,
                     anilist_data=anilist_data,
                     fribb_data=fribb_data,
                     tmdb_details=tmdb_details,
                     explicit_season=season,
+                    calculated_offset=calculated_offset,
                 )
                 target_seasons = decision["season_numbers"]
                 slice_offset = decision["episode_offset"]
