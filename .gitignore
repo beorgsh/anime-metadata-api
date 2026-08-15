@@ -7,3 +7,5 @@ venv/
 data/anilist_index.json
 data/anime-list-mini.json
 *.log
+venv/
+start.sh
