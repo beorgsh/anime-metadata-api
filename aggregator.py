@@ -104,6 +104,103 @@ def _within_30_days(air_date: str, today: str) -> bool:
         return False
 
 
+
+def _cross_verify_and_filter(
+    episodes: list[dict],
+    anilist_data: dict,
+    anilist_next_airing: Optional[int],
+    include_upcoming: bool,
+) -> list[dict]:
+    """Cross-verify episode list with AniList data and filter unaired episodes.
+
+    This is the API's "own brain" for episode count verification:
+
+    1. If AniList says nextAiringEpisode=N (ongoing):
+       - Episodes 1..N-1 should have aired
+       - Cap at N-1, BUT allow episodes that TMDB says aired within last 30 days
+         (catches AniList schedule lag, e.g. Re:Zero S4 EP 13 aired per TMDB
+         but AniList still says nextAiring=13)
+    2. If AniList is FINISHED (no nextAiring):
+       - Return all episodes in the range
+       - Cross-verify: count should match AniList's `episodes` field
+         (if mismatch, log a warning but still return what we have)
+    3. Filter unaired episodes by default (air_date > today)
+       - Exception: if include_upcoming=True, keep all
+
+    Returns the filtered + verified episode list.
+    """
+    if not episodes:
+        return episodes
+
+    today = time.strftime("%Y-%m-%d")
+
+    # ── Step 1: Apply nextAiring cap (with 30-day grace period) ──
+    if anilist_next_airing and anilist_next_airing > 0:
+        capped = []
+        for ep in episodes:
+            ep_num = ep.get("number", 0)
+            if ep_num < anilist_next_airing:
+                # Below cap — always include
+                capped.append(ep)
+            else:
+                # At or past cap — only include if TMDB says it aired recently
+                air_date = ep.get("airDate", "") or ""
+                if air_date and air_date <= today and _within_30_days(air_date, today):
+                    capped.append(ep)
+                elif include_upcoming:
+                    capped.append(ep)
+        episodes = capped
+
+    # ── Step 2: Filter unaired episodes (unless include_upcoming) ──
+    if not include_upcoming:
+        filtered = []
+        for ep in episodes:
+            air_date = ep.get("airDate", "") or ""
+            if not air_date:
+                # No air date — include it (might be a special or unknown)
+                filtered.append(ep)
+            elif air_date <= today:
+                # Already aired
+                filtered.append(ep)
+            elif _within_30_days(air_date, today):
+                # Airing soon (within 30 days) — include it
+                filtered.append(ep)
+            # else: future episode, skip
+        episodes = filtered
+
+    # ── Step 3: Cross-verify count ──
+    anilist_eps = None
+    try:
+        anilist_eps = int((anilist_data or {}).get("episodes") or 0)
+    except (TypeError, ValueError):
+        pass
+
+    if anilist_eps and anilist_eps > 0 and len(episodes) > 0:
+        if anilist_next_airing:
+            # Ongoing — our count should be <= anilist_eps and = nextAiring-1 (approximately)
+            expected_aired = anilist_next_airing - 1
+            if len(episodes) > anilist_eps:
+                log.warning("AniList %s: returned %d episodes but AniList says only %d total",
+                           anilist_data.get("id"), len(episodes), anilist_eps)
+                episodes = episodes[:anilist_eps]
+        else:
+            # Finished — count should match AniList exactly
+            if len(episodes) != anilist_eps:
+                log.warning("AniList %s: returned %d episodes but AniList says %d (diff=%d)",
+                           anilist_data.get("id"), len(episodes), anilist_eps,
+                           len(episodes) - anilist_eps)
+
+    # ── Step 4: Renumber (in case filtering removed episodes) ──
+    # Only renumber if the episodes are in AniList space (not TMDB continuous)
+    # We detect this by checking if the first episode starts at 1
+    if episodes and episodes[0].get("number", 0) == 1:
+        for i, ep in enumerate(episodes, 1):
+            ep["number"] = i
+            ep["id"] = f"{anilist_data.get('id', 'unknown')}-{i}"
+
+    return episodes
+
+
 async def _fetch_all_impl(
     anilist_id: int,
     *,
@@ -210,49 +307,80 @@ async def _fetch_all_impl(
                     calculated_offset=None,  # try without chain offset first
                 )
 
-                # ── AniBridge exact episode range (PRIMARY for Pattern A) ──
+                # ── AniBridge exact episode range (PRIMARY source) ──
+                # AniBridge provides exact TMDB episode ranges for each AniList ID.
+                # This handles ALL patterns:
+                #   - Pattern A (split-cour): TMDB range ≠ AniList range (e.g. 39-50 → 1-12)
+                #   - Pattern B (multi-season): identity mapping, multiple TMDB seasons
+                #   - Pattern C (simple): identity mapping, 1 TMDB season
+                #   - Ongoing: open-ended ranges like "1-" → "1-"
                 anibridge_used = False
                 anibridge_pattern_a = False  # True = already fetched + sliced, skip season fetch
                 if anibridge_entries and not extras:
                     first_ab = anibridge_entries[0]
-                    if not anibridge_local.is_identity_mapping(first_ab):
-                        # Pattern A: non-identity mapping — slice by exact range
-                        _ab_start, _ab_end = anibridge_local.get_tmdb_episode_range(first_ab)
+                    is_identity = anibridge_local.is_identity_mapping(first_ab)
+                    _ab_start, _ab_end = anibridge_local.get_tmdb_episode_range(first_ab)
+
+                    if not is_identity:
+                        # Pattern A: non-identity mapping — slice TMDB by exact range
+                        # (e.g. Re:Zero S2P2: TMDB EP 39-50 → AniList EP 1-12)
                         target_seasons = [first_ab["tmdb_season"]]
                         _sd = await tmdb.fetch_tv_season(tmdb_id, first_ab["tmdb_season"], client)
                         if isinstance(_sd, dict):
                             _all = tmdb.extract_episodes(_sd, anilist_id)
-                            tmdb_episodes = [e for e in _all if _ab_start <= e.get("number", 0) <= (_ab_end if _ab_end < 999999 else 999999)]
+                            # Filter to exact TMDB episode range
+                            _ab_end_real = _ab_end if _ab_end < 999999 else 999999
+                            tmdb_episodes = [e for e in _all
+                                if _ab_start <= e.get("number", 0) <= _ab_end_real]
+                            # Renumber to AniList space (1..N)
                             for i, ep in enumerate(tmdb_episodes, 1):
                                 ep["number"] = i
                                 ep["id"] = f"{anilist_id}-{i}"
                                 ep["season"] = first_ab["tmdb_season"]
-                            # Apply nextAiring cap + filter unaired
-                            _today = time.strftime("%Y-%m-%d")
-                            if anilist_next_airing and anilist_next_airing > 0:
-                                tmdb_episodes = [ep for ep in tmdb_episodes
-                                    if ep.get("number", 0) < anilist_next_airing
-                                    or (ep.get("airDate", "") and ep.get("airDate", "") <= _today
-                                        and _within_30_days(ep.get("airDate", ""), _today))]
-                            if not include_upcoming:
-                                tmdb_episodes = [ep for ep in tmdb_episodes
-                                    if not ep.get("airDate", "") or ep.get("airDate", "") <= _today or _within_30_days(ep.get("airDate", ""), _today)]
-                            # Renumber after filtering
-                            for i, ep in enumerate(tmdb_episodes, 1):
-                                ep["number"] = i
-                                ep["id"] = f"{anilist_id}-{i}"
+                            # ── Cross-verification + filtering ──
+                            tmdb_episodes = _cross_verify_and_filter(
+                                tmdb_episodes, anilist_data, anilist_next_airing, include_upcoming
+                            )
                             pattern = "pattern_a_anibridge"
                             slice_offset = 0
                             slice_count = None
                             continuous_numbering = False
                             anibridge_used = True
                             anibridge_pattern_a = True
+
                     elif len(anibridge_entries) > 1:
-                        # Pattern B: identity, multi-season — fetch all listed seasons
+                        # Pattern B: identity mapping, multiple TMDB seasons
+                        # (e.g. One Piece: 22 TMDB seasons, each identity-mapped)
                         target_seasons = [e["tmdb_season"] for e in anibridge_entries]
                         pattern = "pattern_b_anibridge"
                         continuous_numbering = True
                         anibridge_used = True
+                        # Don't set anibridge_pattern_a — we still need to fetch seasons
+
+                    else:
+                        # Single entry, identity mapping (Pattern C / ongoing single-season)
+                        # (e.g. Hell Mode S2: TMDB S2, identity, open-ended "1-" → "1-")
+                        target_seasons = [first_ab["tmdb_season"]]
+                        _sd = await tmdb.fetch_tv_season(tmdb_id, first_ab["tmdb_season"], client)
+                        if isinstance(_sd, dict):
+                            _all = tmdb.extract_episodes(_sd, anilist_id)
+                            # Filter to TMDB episode range (for open-ended, keep all)
+                            _ab_end_real = _ab_end if _ab_end < 999999 else 999999
+                            tmdb_episodes = [e for e in _all
+                                if _ab_start <= e.get("number", 0) <= _ab_end_real]
+                            # For identity mapping, keep TMDB numbering (1..N)
+                            for ep in tmdb_episodes:
+                                ep["season"] = first_ab["tmdb_season"]
+                            # ── Cross-verification + filtering ──
+                            tmdb_episodes = _cross_verify_and_filter(
+                                tmdb_episodes, anilist_data, anilist_next_airing, include_upcoming
+                            )
+                            pattern = "pattern_c_anibridge" if not anilist_next_airing else "pattern_a_anibridge"
+                            slice_offset = 0
+                            slice_count = None
+                            continuous_numbering = False
+                            anibridge_used = True
+                            anibridge_pattern_a = True
 
                 # AniZip (TVDB) fallback for Pattern A critical cases (SECONDARY)
 
