@@ -10,6 +10,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY api.py aggregator.py resolver.py verifier.py seasons.py cache.py ./
 COPY sources/ ./sources/
 
+# Copy AniBridge mappings data (downloaded at build time)
+COPY data/anibridge_mappings.json ./data/anibridge_mappings.json
+
 # Data directory for Fribb JSON (downloaded at startup)
 RUN mkdir -p /app/data
 COPY data/.gitignore ./data/.gitignore

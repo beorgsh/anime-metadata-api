@@ -45,7 +45,7 @@ from dotenv import load_dotenv
 
 from aggregator import fetch_all
 from cache import metadata_cache, tmdb_id_cache
-from sources import fribb, anilist as anilist_source, anibridge
+from sources import fribb, anilist as anilist_source, anibridge, anibridge_local
 
 load_dotenv()
 
@@ -55,15 +55,21 @@ log = logging.getLogger("api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Download + load Fribb mapping data at startup, plus shared HTTP client."""
-    log.info("Loading Fribb AniList↔TMDB mapping data...")
-    # Run in thread pool to not block event loop
+    """Download + load mapping data at startup, plus shared HTTP client."""
+    # Load AniBridge local mappings (PRIMARY source — ~14MB, in-memory)
+    log.info("Loading AniBridge local mappings...")
     loop = asyncio.get_event_loop()
+    ok_ab = await loop.run_in_executor(None, anibridge_local.ensure_loaded)
+    if ok_ab:
+        log.info("AniBridge loaded: %s", anibridge_local.stats())
+    else:
+        log.warning("AniBridge failed to load — will use Fribb fallback")
+
+    # Load Fribb (SECONDARY source)
+    log.info("Loading Fribb AniList↔TMDB mapping data...")
     ok = await loop.run_in_executor(None, fribb.ensure_loaded)
     if ok:
         log.info("Fribb loaded: %s", fribb.stats())
-        # Pre-build the reverse index so the first request doesn't pay for it
-        # (~200ms one-time cost moved to startup instead of first request).
         loop.run_in_executor(None, fribb.lookup_siblings_by_tmdb_tv, 0)
     else:
         log.warning("Fribb failed to load — will use TMDB search fallback only")
@@ -258,6 +264,7 @@ async def health():
     return {
         "status": "ok",
         "sources": {
+            "anibridge_local": anibridge_local.stats(),
             "fribb": fribb.stats(),
             "anibridge": anibridge.stats(),
         },

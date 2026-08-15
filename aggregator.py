@@ -35,6 +35,7 @@ import httpx
 from cache import metadata_cache, offset_cache
 from sources import anilist, anizip, fribb, tmdb
 from sources.anizip import fetch_anizip as _fetch_anizip
+from sources import anibridge_local
 from resolver import resolve_tmdb_id
 from seasons import (
     detect_pattern,
@@ -91,6 +92,18 @@ async def fetch_all(
         return result
 
 
+
+def _within_30_days(air_date: str, today: str) -> bool:
+    """Check if air_date is within the last 30 days from today."""
+    try:
+        from datetime import date
+        d_air = date.fromisoformat(air_date)
+        d_today = date.fromisoformat(today)
+        return (d_today - d_air).days <= 30
+    except Exception:
+        return False
+
+
 async def _fetch_all_impl(
     anilist_id: int,
     *,
@@ -121,8 +134,24 @@ async def _fetch_all_impl(
         fribb_season = (fribb_data.get('season') or {}).get('tmdb')
         fribb_offset = (fribb_data.get('episode_offset') or {}).get('tmdb') or 0
 
-    # ── Stage 2: Resolve TMDB ID (Fribb-first, with fallbacks) ─────
-    tmdb_resolution = await resolve_tmdb_id(anilist_id, anilist_data, fribb_data)
+    # ── Stage 2: Resolve TMDB ID ────────────────────────────────────
+    # PRIMARY: AniBridge local mappings (exact episode ranges, most accurate)
+    # SECONDARY: Fribb + AniBridge API + TMDB /search (fallback chain)
+    anibridge_entries = None
+    if anibridge_local.is_loaded():
+        anibridge_entries = anibridge_local.lookup_anilist(anilist_id)
+
+    if anibridge_entries:
+        # AniBridge has the mapping — use it directly (skip resolver!)
+        first_entry = anibridge_entries[0]
+        tmdb_type = first_entry.get("tmdb_type", "tv")
+        tmdb_id = first_entry.get("tmdb_id")
+        resolver_method = "anibridge_local"
+        # Don't call resolve_tmdb_id at all
+        tmdb_resolution = {"tmdb_type": tmdb_type, "tmdb_id": tmdb_id, "method": "anibridge_local", "fribb_data": fribb_data, "tried_sources": ["anibridge_local"]}
+    else:
+        # Fall back to Fribb → AniBridge API → TMDB /search
+        tmdb_resolution = await resolve_tmdb_id(anilist_id, anilist_data, fribb_data)
     tmdb_type = tmdb_resolution.get("tmdb_type")
     tmdb_id = tmdb_resolution.get("tmdb_id")
     # Refresh fribb_data in case the resolver enriched it
@@ -181,9 +210,55 @@ async def _fetch_all_impl(
                     calculated_offset=None,  # try without chain offset first
                 )
 
-                # AniZip (TVDB) fallback for Pattern A critical cases
+                # ── AniBridge exact episode range (PRIMARY for Pattern A) ──
+                anibridge_used = False
+                anibridge_pattern_a = False  # True = already fetched + sliced, skip season fetch
+                if anibridge_entries and not extras:
+                    first_ab = anibridge_entries[0]
+                    if not anibridge_local.is_identity_mapping(first_ab):
+                        # Pattern A: non-identity mapping — slice by exact range
+                        _ab_start, _ab_end = anibridge_local.get_tmdb_episode_range(first_ab)
+                        target_seasons = [first_ab["tmdb_season"]]
+                        _sd = await tmdb.fetch_tv_season(tmdb_id, first_ab["tmdb_season"], client)
+                        if isinstance(_sd, dict):
+                            _all = tmdb.extract_episodes(_sd, anilist_id)
+                            tmdb_episodes = [e for e in _all if _ab_start <= e.get("number", 0) <= (_ab_end if _ab_end < 999999 else 999999)]
+                            for i, ep in enumerate(tmdb_episodes, 1):
+                                ep["number"] = i
+                                ep["id"] = f"{anilist_id}-{i}"
+                                ep["season"] = first_ab["tmdb_season"]
+                            # Apply nextAiring cap + filter unaired
+                            _today = time.strftime("%Y-%m-%d")
+                            if anilist_next_airing and anilist_next_airing > 0:
+                                tmdb_episodes = [ep for ep in tmdb_episodes
+                                    if ep.get("number", 0) < anilist_next_airing
+                                    or (ep.get("airDate", "") and ep.get("airDate", "") <= _today
+                                        and _within_30_days(ep.get("airDate", ""), _today))]
+                            if not include_upcoming:
+                                tmdb_episodes = [ep for ep in tmdb_episodes
+                                    if not ep.get("airDate", "") or ep.get("airDate", "") <= _today or _within_30_days(ep.get("airDate", ""), _today)]
+                            # Renumber after filtering
+                            for i, ep in enumerate(tmdb_episodes, 1):
+                                ep["number"] = i
+                                ep["id"] = f"{anilist_id}-{i}"
+                            pattern = "pattern_a_anibridge"
+                            slice_offset = 0
+                            slice_count = None
+                            continuous_numbering = False
+                            anibridge_used = True
+                            anibridge_pattern_a = True
+                    elif len(anibridge_entries) > 1:
+                        # Pattern B: identity, multi-season — fetch all listed seasons
+                        target_seasons = [e["tmdb_season"] for e in anibridge_entries]
+                        pattern = "pattern_b_anibridge"
+                        continuous_numbering = True
+                        anibridge_used = True
+
+                # AniZip (TVDB) fallback for Pattern A critical cases (SECONDARY)
 
                 anizip_provided = False
+                if anibridge_used:
+                    pass  # Skip AniZip — AniBridge already provided episodes
 
                 _is_pa = bool(fribb_offset) or bool(fribb_season)
 
@@ -292,7 +367,7 @@ async def _fetch_all_impl(
                 pattern = decision["pattern"]
                 continuous_numbering = decision["continuous_numbering"]
 
-            if anizip_provided:
+            if anizip_provided or anibridge_pattern_a:
                 target_seasons = []
             # Fetch all required TMDB seasons in parallel
             season_tasks = [
