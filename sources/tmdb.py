@@ -93,23 +93,52 @@ async def find_by_external_id(external_id: str, source: str, client: Optional[ht
     return None
 
 
-async def search(query: str, media_type: str = "tv", year: Optional[int] = None,
-                 client: Optional[httpx.AsyncClient] = None) -> Optional[int]:
+async def search(
+    query: str, 
+    media_type: str = "tv", 
+    year: Optional[int] = None,
+    client: Optional[httpx.AsyncClient] = None
+) -> Optional[int]:
     """
-    TMDB /search/tv or /search/movie — search by name.
-    media_type: "tv" or "movie"
-    year: first_air_date_year (TV) or year (movie)
-    Returns TMDB ID or None.
+    Search TMDB by title with anime-first prioritization:
+    - Filters/prioritizes Japanese origin shows ('ja' / 'JP')
+    - Matches first_air_date_year when provided
     """
-    params = {"query": query, "language": "en-US", "page": 1, "include_adult": "false"}
+    params = {
+        "query": query, 
+        "language": "en-US", 
+        "page": 1, 
+        "include_adult": "false"
+    }
     if year:
         if media_type == "tv":
             params["first_air_date_year"] = year
         else:
             params["year"] = year
+
     data = await _get(f"/search/{media_type}", params, client)
     results = data.get("results", [])
-    return results[0]["id"] if results else None
+
+    if not results:
+        # Fallback: if search with year found nothing, retry without year
+        if year:
+            params.pop("first_air_date_year", None)
+            params.pop("year", None)
+            data = await _get(f"/search/{media_type}", params, client)
+            results = data.get("results", [])
+
+    if not results:
+        return None
+
+    # Filter to prioritize Japanese animation over Western live-action adaptations
+    for item in results:
+        orig_lang = item.get("original_language")
+        origin_country = item.get("origin_country", [])
+        if orig_lang == "ja" or "JP" in origin_country:
+            return item["id"]
+
+    # If no Japanese origin found, fallback to first result
+    return results[0]["id"]
 
 
 async def fetch_tv(tmdb_id: int, client: Optional[httpx.AsyncClient] = None) -> dict:
