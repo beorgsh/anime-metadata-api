@@ -100,14 +100,14 @@ async def search(
     client: Optional[httpx.AsyncClient] = None
 ) -> Optional[int]:
     """
-    Search TMDB by title with anime-first prioritization:
-    - Filters/prioritizes Japanese origin shows ('ja' / 'JP')
-    - Matches first_air_date_year when provided
+    TMDB search with anime prioritization:
+    - Filters for Japanese anime (original_language: 'ja' / origin_country: 'JP')
+    - Matches first_air_date_year (1999 for One Piece)
     """
     params = {
-        "query": query, 
-        "language": "en-US", 
-        "page": 1, 
+        "query": query,
+        "language": "en-US",
+        "page": 1,
         "include_adult": "false"
     }
     if year:
@@ -119,25 +119,24 @@ async def search(
     data = await _get(f"/search/{media_type}", params, client)
     results = data.get("results", [])
 
-    if not results:
-        # Fallback: if search with year found nothing, retry without year
-        if year:
-            params.pop("first_air_date_year", None)
-            params.pop("year", None)
-            data = await _get(f"/search/{media_type}", params, client)
-            results = data.get("results", [])
+    # If search with year returned nothing, retry without year restriction
+    if not results and year:
+        params.pop("first_air_date_year", None)
+        params.pop("year", None)
+        data = await _get(f"/search/{media_type}", params, client)
+        results = data.get("results", [])
 
     if not results:
         return None
 
-    # Filter to prioritize Japanese animation over Western live-action adaptations
+    # 1. Prioritize Japanese anime (original_language == 'ja' or JP origin)
     for item in results:
-        orig_lang = item.get("original_language")
-        origin_country = item.get("origin_country", [])
-        if orig_lang == "ja" or "JP" in origin_country:
+        orig_lang = item.get("original_language", "")
+        countries = item.get("origin_country", [])
+        if orig_lang == "ja" or "JP" in countries:
             return item["id"]
 
-    # If no Japanese origin found, fallback to first result
+    # 2. Fallback to first result if no Japanese show found
     return results[0]["id"]
 
 
