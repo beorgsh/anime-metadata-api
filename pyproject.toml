@@ -1,2 +1,16 @@
+[project]
+name = "anime-metadata-api"
+version = "3.0.0"
+description = "Anime Metadata API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.22.0",
+    "httpx>=0.24.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
 [tool.vercel]
 entrypoint = "api:app"
