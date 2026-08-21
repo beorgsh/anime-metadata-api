@@ -43,6 +43,7 @@ from seasons import (
     resolve_target_season,
     slice_episodes,
     get_seasons_summary,
+    detect_season_from_title
 )
 
 log = logging.getLogger("aggregator")
