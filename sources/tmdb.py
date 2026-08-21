@@ -37,7 +37,7 @@ TIMEOUT = 15.0
 def _get_key() -> str:
     """Return the TMDB API key from the environment."""
     import os
-    key = os.environ.get("TMDB_API_KEY")
+    key = os.environ.get("0ad803880e6b039907683824e369d54a")
     if not key:
         raise RuntimeError(
             "TMDB_API_KEY environment variable is not set. "
