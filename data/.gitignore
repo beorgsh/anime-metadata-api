@@ -1,0 +1,11 @@
+# Anime Metadata API — data directory
+
+This directory holds the downloaded Fribb mapping JSON files.
+They are downloaded at startup (first run) and refreshed weekly.
+
+Do NOT commit these files — they're downloaded at runtime.
+
+Files:
+- anilist_index.json  (1.3 MB — AniList ID → position lookup)
+- anime-list-mini.json (5.9 MB — full mapping data)
+

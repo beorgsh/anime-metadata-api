@@ -1,0 +1,15 @@
+# Render.com deployment config
+# Deploys the pre-built Docker image from ghcr.io
+services:
+  - type: web
+    name: anime-metadata-api
+    runtime: image
+    image:
+      url: ghcr.io/historiesofhistory-arch/anime-metadata-api:latest
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    healthCheckPath: /health
+    autoDeploy: true

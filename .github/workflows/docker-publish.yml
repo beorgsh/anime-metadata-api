@@ -1,0 +1,88 @@
+name: Build and Publish Docker Image
+
+# This workflow builds the Docker image and publishes it to GitHub Container Registry (ghcr.io).
+# The resulting image can be used directly on Render, Railway, Fly.io, Koyeb, or any platform
+# that supports deploying pre-built Docker images.
+#
+# Image URL after first run:
+#   ghcr.io/historiesofhistory-arch/anime-metadata-api:latest
+#
+# On Render:
+#   1. Create a "Web Service" → "Existing image from registry"
+#   2. Image URL: ghcr.io/historiesofhistory-arch/anime-metadata-api:latest
+#   3. Set env vars: PORT=8000
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - api.py
+      - aggregator.py
+      - resolver.py
+      - cache.py
+      - sources/**
+      - requirements.txt
+      - Dockerfile
+      - .github/workflows/docker-publish.yml
+  workflow_dispatch:
+  release:
+    types: [published]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Image published
+        run: |
+          echo "✅ Image published to ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo ""
+          echo "Pull with:"
+          echo "  docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo ""
+          echo "Run with:"
+          echo "  docker run -p 8000:8000 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
